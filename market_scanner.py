@@ -13,10 +13,10 @@ import os
 
 # --- CONFIGURATION ---
 # These pull the "Secrets" you saved in GitHub Settings
-GENAI_API_KEY = os.environ.get("AIzaSyBWTZ_IzOPJsg189w4jxnbsNnaVpPsdnPk")
-EMAIL_SENDER = os.environ.get("coolcreeper6277@gmail.com")
-EMAIL_PASSWORD = os.environ.get("cewe sxtj ztwy pixo") 
-EMAIL_RECEIVER = os.environ.get("theerth.srinivasan@gmail.com")
+GENAI_API_KEY = os.environ.get("GENAI_API_KEY")
+EMAIL_SENDER = os.environ.get("EMAIL_SENDER")
+EMAIL_PASSWORD = os.environ.get("EMAIL_PASSWORD") 
+EMAIL_RECEIVER = os.environ.get("EMAIL_RECEIVER")
 
 # Safety check to ensure secrets are loaded
 if not GENAI_API_KEY:
