@@ -1,31 +1,26 @@
-name: Daily Stock Scanner
+name: Debug Secrets
 
-on:
-  schedule:
-    - cron: '0 13 * * 1-5'
-  workflow_dispatch:
+on: workflow_dispatch
 
 jobs:
-  run-scanner:
+  debug-keys:
     runs-on: ubuntu-latest
-
     steps:
-      - name: Checkout Code
-        uses: actions/checkout@v3
-
-      - name: Set up Python
-        uses: actions/setup-python@v4
-        with:
-          python-version: '3.12'
-
-      - name: Install Dependencies
-        run: |
-          pip install -r requirements.txt
-
-      - name: Run Scanner Script
+      - name: Check Environment Variables
         env:
           GENAI_API_KEY: ${{ secrets.GENAI_API_KEY }}
           EMAIL_SENDER: ${{ secrets.EMAIL_SENDER }}
-          EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
-          EMAIL_RECEIVER: ${{ secrets.EMAIL_RECEIVER }}
-        run: python market_scanner.py
+        run: |
+          echo "--- DEBUGGING KEYS ---"
+          
+          if [ -z "$GENAI_API_KEY" ]; then
+            echo "❌ GENAI_API_KEY is EMPTY or MISSING"
+          else
+            echo "✅ GENAI_API_KEY is FOUND (Length: ${#GENAI_API_KEY} characters)"
+          fi
+
+          if [ -z "$EMAIL_SENDER" ]; then
+            echo "❌ EMAIL_SENDER is EMPTY or MISSING"
+          else
+            echo "✅ EMAIL_SENDER is FOUND: $EMAIL_SENDER"
+          fi
