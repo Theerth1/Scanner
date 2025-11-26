@@ -1,0 +1,4 @@
+- improves scanning method that I currently use to find stocks (trading w/trend + breakout after consolidation)
+- accounts for volume, nonpenny, stochrsi, catos smas, MACD, and DMI
+- of all tickers, it finds the stocks that best match the green signal with all these indicators and the ones with >80% are fed to gemini to get fundamental analysis
+- of the finalized, good to go stocks, theyre sent to my email every morning
