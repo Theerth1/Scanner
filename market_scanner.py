@@ -225,7 +225,7 @@ def run_scanner():
                 
                 score, reasons = analyze_ticker(ticker, stock_df)
                 
-                if score >= 80:
+                if score >= 10:
                     print(f"🌟 Match Found: {ticker} ({score}%)")
                     high_conviction_list.append({
                         "ticker": ticker,
