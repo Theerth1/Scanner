@@ -185,7 +185,7 @@ def run_scanner():
     chunk_size = 100
     high_conviction_list = []
     
-    print(f"📊 Scanning {len(tickers_to_scan)} stocks for >= 80% matches...")
+    print(f"📊 Scanning {len(tickers_to_scan)} stocks for >= 70% matches...")
 
     for i in range(0, len(tickers_to_scan), chunk_size):
         chunk = tickers_to_scan[i:i+chunk_size]
