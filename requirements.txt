@@ -1,5 +1,5 @@
 yfinance
 pandas
-pandas_ta
+pandas-ta
 google-generativeai
 requests
