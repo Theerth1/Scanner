@@ -185,7 +185,7 @@ def run_scanner():
     chunk_size = 100
     high_conviction_list = []
     
-    print(f"📊 Scanning {len(tickers_to_scan)} stocks for >= 70% matches...")
+    print(f"📊 Scanning {len(tickers_to_scan)} stocks for >= 10% matches...")
 
     for i in range(0, len(tickers_to_scan), chunk_size):
         chunk = tickers_to_scan[i:i+chunk_size]
@@ -202,7 +202,7 @@ def run_scanner():
                 
                 score, reasons = analyze_ticker(ticker, stock_df)
                 
-                if score >= 70:
+                if score >= 10:
                     print(f"🌟 Match Found: {ticker} ({score}%)")
                     high_conviction_list.append({
                         "ticker": ticker,
@@ -214,13 +214,13 @@ def run_scanner():
                 continue
 
     match_count = len(high_conviction_list)
-    print(f"\n🎯 Technical Scan Complete. Found {match_count} stocks with Score >= 70%.")
+    print(f"\n🎯 Technical Scan Complete. Found {match_count} stocks with Score >= 10%.")
     print("🤖 Starting Gemini Analysis on ALL matches (Estimated time: " + str(match_count * 5) + " seconds)...")
 
     high_conviction_list.sort(key=lambda x: x['score'], reverse=True)
 
     email_body = f"☀️ HIGH CONVICTION REPORT: {datetime.date.today()}\n"
-    email_body += f"Found {match_count} stocks with Technical Score >= 70%\n"
+    email_body += f"Found {match_count} stocks with Technical Score >= 10%\n"
     email_body += "========================================\n\n"
 
     for i, stock in enumerate(high_conviction_list):
@@ -237,13 +237,13 @@ def run_scanner():
         time.sleep(5) # Rate limit protection
 
     if not high_conviction_list:
-        print("No stocks passed the 70% threshold today.")
+        print("No stocks passed the 10% threshold today.")
         return
 
     msg = MIMEMultipart()
     msg['From'] = EMAIL_SENDER
     msg['To'] = EMAIL_RECEIVER
-    msg['Subject'] = f"🚀 {match_count} High-Conviction Breakouts (>=70%)"
+    msg['Subject'] = f"🚀 {match_count} High-Conviction Breakouts (>=10%)"
     msg.attach(MIMEText(email_body, 'plain'))
     
     try:
