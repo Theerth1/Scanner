@@ -2,9 +2,8 @@ name: Daily Stock Scanner
 
 on:
   schedule:
-    # Runs at 13:00 UTC every weekday (approx 9:00 AM EST)
     - cron: '0 13 * * 1-5'
-  workflow_dispatch: # Allows you to run it manually by clicking a button
+  workflow_dispatch:
 
 jobs:
   run-scanner:
@@ -25,7 +24,6 @@ jobs:
 
       - name: Run Scanner Script
         env:
-          # This maps the Secrets you saved in Settings -> Secrets
           GENAI_API_KEY: ${{ secrets.GENAI_API_KEY }}
           EMAIL_SENDER: ${{ secrets.EMAIL_SENDER }}
           EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
