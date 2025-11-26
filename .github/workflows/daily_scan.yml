@@ -1,0 +1,33 @@
+name: Daily Stock Scanner
+
+on:
+  schedule:
+    # Runs at 13:00 UTC every weekday (approx 9:00 AM EST)
+    - cron: '0 13 * * 1-5'
+  workflow_dispatch: # Allows you to run it manually by clicking a button
+
+jobs:
+  run-scanner:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v3
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.9'
+
+      - name: Install Dependencies
+        run: |
+          pip install -r requirements.txt
+
+      - name: Run Scanner Script
+        env:
+          # This maps the Secrets you saved in Settings -> Secrets
+          GENAI_API_KEY: ${{ secrets.GENAI_API_KEY }}
+          EMAIL_SENDER: ${{ secrets.EMAIL_SENDER }}
+          EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
+          EMAIL_RECEIVER: ${{ secrets.EMAIL_RECEIVER }}
+        run: python market_scanner.py
