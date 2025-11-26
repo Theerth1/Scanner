@@ -225,7 +225,7 @@ def run_scanner():
                 
                 score, reasons = analyze_ticker(ticker, stock_df)
                 
-                if score >= 10:
+                if score >= 70:
                     print(f"🌟 Match Found: {ticker} ({score}%)")
                     high_conviction_list.append({
                         "ticker": ticker,
@@ -237,13 +237,13 @@ def run_scanner():
                 continue
 
     match_count = len(high_conviction_list)
-    print(f"\n🎯 Technical Scan Complete. Found {match_count} stocks with Score >= 80%.")
+    print(f"\n🎯 Technical Scan Complete. Found {match_count} stocks with Score >= 70%.")
     print("🤖 Starting Gemini Analysis on ALL matches (Estimated time: " + str(match_count * 5) + " seconds)...")
 
     high_conviction_list.sort(key=lambda x: x['score'], reverse=True)
 
     email_body = f"☀️ HIGH CONVICTION REPORT: {datetime.date.today()}\n"
-    email_body += f"Found {match_count} stocks with Technical Score >= 80%\n"
+    email_body += f"Found {match_count} stocks with Technical Score >= 70%\n"
     email_body += "========================================\n\n"
 
     for i, stock in enumerate(high_conviction_list):
@@ -260,13 +260,13 @@ def run_scanner():
         time.sleep(5) # Rate limit protection
 
     if not high_conviction_list:
-        print("No stocks passed the 80% threshold today.")
+        print("No stocks passed the 70% threshold today.")
         return
 
     msg = MIMEMultipart()
     msg['From'] = EMAIL_SENDER
     msg['To'] = EMAIL_RECEIVER
-    msg['Subject'] = f"🚀 {match_count} High-Conviction Breakouts (>=80%)"
+    msg['Subject'] = f"🚀 {match_count} High-Conviction Breakouts (>=70%)"
     msg.attach(MIMEText(email_body, 'plain'))
     
     try:
