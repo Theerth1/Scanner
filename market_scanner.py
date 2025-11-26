@@ -58,97 +58,74 @@ def get_data_bulk(tickers):
         return pd.DataFrame()
 
 # --- 3. THE "CATOS" STRATEGY ENGINE (Fibonacci + DMI) ---
+# --- 3. THE STRATEGY ENGINE (Debug Version) ---
 def analyze_ticker(ticker, df):
     try:
-        # Filter 1: Data Sufficiency (Need ~250 days for 233 SMA)
+        # 1. Clean Data
+        df = df.dropna()
         if len(df) < 250: return 0, []
+        
+        # 2. Check Columns (Debug Step)
+        # This ensures we actually have a "Close" column
+        if 'Close' not in df.columns:
+            # Try to fix column names if they are weird
+            df.columns = [c[0] if isinstance(c, tuple) else c for c in df.columns]
+            if 'Close' not in df.columns:
+                print(f"⚠️ {ticker}: Missing 'Close' column. Columns are: {df.columns}")
+                return 0, []
 
-        # Filter 2: Price > $1.00 (Avoid penny stocks)
+        # 3. Filter Penny Stocks
         last_price = df['Close'].iloc[-1]
         if last_price < 1.00: return 0, []
-
-        # Drop NaN
-        df = df.dropna()
-        if df.empty: return 0, []
 
         # --- INDICATORS ---
         close = df['Close']
         high = df['High']
         low = df['Low']
         
-        # 1. Fibonacci SMAs
+        # Calculate Indicators
         sma_21 = ta.sma(close, length=21)
         sma_55 = ta.sma(close, length=55)
         sma_233 = ta.sma(close, length=233)
-        
-        # 2. MACD (12, 26, 9)
         macd = ta.macd(close)
         hist = macd['MACDh_12_26_9']
-        
-        # 3. DMI / ADX (14)
         dmi = ta.adx(high, low, close, length=14)
         adx = dmi['ADX_14']
         pos_di = dmi['DMP_14']
         neg_di = dmi['DMN_14']
-
-        # 4. StochRSI (Custom 14, 14, 7, 5)
         stoch_rsi = ta.stochrsi(close, length=14, rsi_length=14, k=7, d=5)
         srsi_k = stoch_rsi.iloc[:, 0]
         srsi_d = stoch_rsi.iloc[:, 1]
-        
-        # 5. Volume
         vol_sma = ta.sma(df['Volume'], length=20)
 
-        # Current Values
-        s21 = sma_21.iloc[-1]
-        s55 = sma_55.iloc[-1]
-        s233 = sma_233.iloc[-1]
-        hist_curr = hist.iloc[-1]
-        hist_prev = hist.iloc[-2]
-        
+        # Score Logic
         score = 0
         reasons = []
 
-        # --- SCORING (Strict) ---
-
-        # 1. FIBONACCI TREND (30 pts)
-        if last_price > s21 > s55 > s233:
+        if last_price > sma_21.iloc[-1] > sma_55.iloc[-1] > sma_233.iloc[-1]:
             score += 30
-            reasons.append("✅ Perfect Fib Trend (Price>21>55>233)")
-        elif last_price > s233 and s21 > s55:
-            score += 15
-            reasons.append("✅ Bullish Trend (Price > 233)")
+            reasons.append("Perfect Fib Trend")
+        elif last_price > sma_233.iloc[-1]:
+            score += 10 # Give at least some points if above 200 SMA
+            reasons.append("Above 233 SMA")
 
-        # 2. MACD MOMENTUM (20 pts)
-        if hist_curr > 0 and hist_curr > hist_prev:
+        if hist.iloc[-1] > 0 and hist.iloc[-1] > hist.iloc[-2]:
             score += 20
-            reasons.append("✅ MACD Expanding")
+            reasons.append("MACD Rising")
 
-        # 3. DMI CONFIRMATION (20 pts)
         if pos_di.iloc[-1] > neg_di.iloc[-1]:
-            if adx.iloc[-1] > 25:
-                score += 20
-                reasons.append(f"✅ Strong ADX Trend ({int(adx.iloc[-1])})")
-            elif adx.iloc[-1] > 20:
-                score += 10
-                reasons.append("✅ Positive DMI")
+            score += 20
+            reasons.append("Positive DMI")
 
-        # 4. STOCH RSI (15 pts) - Signal Line Cross
-        if (srsi_k.iloc[-2] < srsi_d.iloc[-2]) and (srsi_k.iloc[-1] > srsi_d.iloc[-1]):
-            score += 15
-            reasons.append("✅ StochRSI Buy Cross")
-        elif srsi_k.iloc[-1] < 20:
-             score += 10
-             reasons.append("✅ StochRSI Oversold")
-
-        # 5. VOLUME (15 pts)
-        if df['Volume'].iloc[-1] > (vol_sma.iloc[-1] * 1.2):
-            score += 15
-            reasons.append("✅ High Volume")
+        # Debug Print for the first few stocks
+        # This will show up in your GitHub logs so you can see the math working
+        print(f"🔍 {ticker} Score: {score} | Price: {last_price:.2f}")
 
         return score, reasons
 
-    except Exception:
+    except Exception as e:
+        # PRINT THE ERROR so we can see it in the logs
+        print(f"❌ CRASH on {ticker}: {e}")
         return 0, []
 
 # --- 4. GEMINI FUNDAMENTAL CHECK ---
