@@ -1,16 +1,31 @@
 #!/usr/bin/env python3
 """
 market_scanner.py
-Improved version: safer secrets, startup email, robust yfinance handling, chunking/retries,
-and guaranteed email on no matches. Designed to run from GitHub Actions (cron).
+
+Updated: raises technical threshold to 70, adds Gemini fallback model (gemini-pro),
+and implements an AI fail-safe: after 5 consecutive AI failures, stop calling the AI
+and send the technical-only report.
+
+Reads secrets from environment:
+  - GENAI_API_KEY
+  - EMAIL_SENDER
+  - EMAIL_PASSWORD
+  - EMAIL_RECEIVER
+
+Assumes requirements.txt includes:
+  yfinance
+  pandas
+  pandas_ta
+  google-generativeai>=0.8.3
+  requests
 """
 
 import os
 import time
 import datetime
-import requests
-import io
 import traceback
+import io
+import requests
 import yfinance as yf
 import pandas as pd
 import pandas_ta as ta
@@ -19,41 +34,33 @@ import smtplib
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 
-# ------------- CONFIG (read from env / secrets) -------------
+# ---------------- CONFIG ----------------
 GENAI_API_KEY = os.environ.get("GENAI_API_KEY")
 EMAIL_SENDER = os.environ.get("EMAIL_SENDER")
 EMAIL_PASSWORD = os.environ.get("EMAIL_PASSWORD")
 EMAIL_RECEIVER = os.environ.get("EMAIL_RECEIVER")
 
-# Basic checks
-missing = []
-for name, val in [
-    ("GENAI_API_KEY", GENAI_API_KEY),
-    ("EMAIL_SENDER", EMAIL_SENDER),
-    ("EMAIL_PASSWORD", EMAIL_PASSWORD),
-    ("EMAIL_RECEIVER", EMAIL_RECEIVER),
-]:
-    if not val:
-        missing.append(name)
+# Scanner tuning
+CHUNK_SIZE = 30
+SLEEP_BETWEEN_CHUNKS = 1.5
+SLEEP_BETWEEN_AI = 5
+TECHNICAL_SCORE_THRESHOLD = 70  # <-- raised from 10 to 70
+MIN_DATA_ROWS = 250
 
-if missing:
-    print(f"❌ Missing environment variables: {missing}")
-    # still continue so the startup email attempt will show failure if SMTP creds missing
-else:
-    print("✅ All required env vars appear present.")
+# AI behavior
+AI_PRIMARY_MODEL = "gemini-1.5-flash"
+AI_FALLBACK_MODEL = "gemini-pro"
+AI_MAX_RETRIES = 3
+AI_MAX_CONSECUTIVE_FAILURES = 5  # stop calling AI after this many consecutive failures
 
-# Configure Gemini (if key present)
-try:
-    if GENAI_API_KEY:
+# ---------------- Setup ----------------
+if GENAI_API_KEY:
+    try:
         genai.configure(api_key=GENAI_API_KEY)
-except Exception as e:
-    print(f"⚠️ Warning: couldn't configure Gemini: {e}")
+    except Exception as e:
+        print(f"⚠️ Warning configuring Gemini client: {e}")
 
-# ------------- Utilities -------------
-def send_email(subject: str, body: str):
-    """
-    Sends an email via Gmail SMTP. Returns True on success, False on failure.
-    """
+def send_email(subject: str, body: str) -> bool:
     msg = MIMEMultipart()
     msg['From'] = EMAIL_SENDER or "unknown"
     msg['To'] = EMAIL_RECEIVER or "unknown"
@@ -61,146 +68,110 @@ def send_email(subject: str, body: str):
     msg.attach(MIMEText(body, 'plain'))
 
     try:
-        if not EMAIL_SENDER or not EMAIL_PASSWORD or not EMAIL_RECEIVER:
-            raise ValueError("Missing email configuration (sender/password/receiver).")
+        if not all([EMAIL_SENDER, EMAIL_PASSWORD, EMAIL_RECEIVER]):
+            raise ValueError("Missing EMAIL_SENDER/EMAIL_PASSWORD/EMAIL_RECEIVER environment variables.")
         server = smtplib.SMTP('smtp.gmail.com', 587, timeout=60)
         server.ehlo()
         server.starttls()
         server.login(EMAIL_SENDER, EMAIL_PASSWORD)
         server.sendmail(EMAIL_SENDER, EMAIL_RECEIVER, msg.as_string())
         server.quit()
-        print("✅ Email Sent.")
+        print("✅ Email sent.")
         return True
     except Exception as e:
-        print(f"❌ Email Failed: {e}")
+        print(f"❌ Email failed: {e}")
         return False
 
-# ------------- 1. Get Tickers -------------
+# ---------------- Utilities ----------------
 def get_all_tickers():
-    print("🌍 Fetching full market ticker list...")
     try:
+        print("🌍 Fetching full ticker list...")
         url = "https://raw.githubusercontent.com/rreichel3/US-Stock-Symbols/main/all/all_tickers.txt"
         s = requests.get(url, timeout=30).content
         tickers = pd.read_csv(io.StringIO(s.decode('utf-8')), header=None)[0].tolist()
-        # filter out test tickers, preferreds, and anything with '^' or '.'
-        clean_tickers = [x for x in tickers if isinstance(x, str) and "^" not in x and "." not in x]
-        print(f"✅ Found {len(clean_tickers)} tickers.")
-        return clean_tickers
+        clean = [t for t in tickers if isinstance(t, str) and "^" not in t and "." not in t]
+        print(f"✅ {len(clean)} tickers found.")
+        return clean
     except Exception as e:
-        print(f"⚠️ Failed to fetch tickers list: {e}. Falling back to sample list.")
+        print(f"⚠️ Couldn't fetch tickers list: {e}. Using fallback sample.")
         return ['AAPL', 'NVDA', 'AMD', 'TSLA', 'MSFT']
 
-# ------------- 2. Bulk downloader with retries and fallbacks -------------
 def get_data_bulk(tickers, period="2y", max_retries=3):
     """
-    Attempts to download historical data for a list of tickers.
-    On persistent failure of the whole chunk, attempts per-ticker fetch (slower).
-    Returns a tuple (dataframe, failed_tickers_list).
+    Download bulk data with retries. If chunk downloads always fail, fallback to per-ticker downloads.
+    Returns (dataframe, failed_list)
     """
     failed = []
-    try:
-        attempt = 0
-        while attempt < max_retries:
-            try:
-                print(f"   ↳ Downloading chunk (size={len(tickers)}), attempt {attempt+1}")
-                data = yf.download(tickers, period=period, group_by='ticker', progress=False, threads=True)
-                if data is None or (isinstance(data, pd.DataFrame) and data.empty):
-                    # Sometimes yfinance returns empty; treat as failure and retry
-                    raise ValueError("Empty dataframe returned")
-                return data, failed
-            except Exception as e:
-                print(f"   ⚠️ Chunk download attempt {attempt+1} failed: {e}")
-                attempt += 1
-                time.sleep(2 + attempt)  # incremental backoff
-        # If chunk still fails, fall back to individual fetches
-        print("   ↳ Chunk downloads failed after retries; falling back to per-ticker download.")
-        all_frames = []
-        for t in tickers:
-            try:
-                single = yf.download(t, period=period, progress=False, threads=False)
-                if single is None or single.empty:
-                    failed.append(t)
-                    continue
-                # rename columns to MultiIndex similar shape for downstream logic, but easier to store as dict
-                # We'll create a panel-like structure by prefixing columns with ticker when needed.
-                # For simplicity, store single-frame keyed externally; caller will detect non-multiindex case.
-                all_frames.append((t, single))
-                time.sleep(1.0)  # be gentle on YF
-            except Exception as e:
+    attempt = 0
+    while attempt < max_retries:
+        try:
+            print(f"   ↳ Downloading chunk size={len(tickers)}, attempt {attempt+1}")
+            data = yf.download(tickers, period=period, group_by='ticker', progress=False, threads=True)
+            if data is None or (isinstance(data, pd.DataFrame) and data.empty):
+                raise ValueError("Empty result from yfinance")
+            return data, failed
+        except Exception as e:
+            print(f"   ⚠️ Chunk download attempt {attempt+1} failed: {e}")
+            attempt += 1
+            time.sleep(1 + attempt)
+    # fallback to individual downloads
+    print("   ↳ Chunk downloads failed after retries; falling back to single-ticker downloads.")
+    frames = []
+    for t in tickers:
+        try:
+            single = yf.download(t, period=period, progress=False, threads=False)
+            if single is None or single.empty:
                 failed.append(t)
-        if not all_frames:
-            return pd.DataFrame(), failed
-        # Convert list of (ticker, df) into a multiindex-like DataFrame where necessary
-        # We'll use pd.concat with keys -> results in MultiIndex columns (ticker, field)
-        assembled = pd.concat([df.rename(columns=lambda c: c) for (_t, df) in all_frames], axis=1, keys=[_t for _t, df in all_frames])
-        return assembled, failed
-    except Exception as e:
-        print(f"   ❌ Unexpected downloader error: {e}")
-        return pd.DataFrame(), tickers  # everything failed
+                continue
+            frames.append((t, single))
+            time.sleep(1.0)
+        except Exception:
+            failed.append(t)
+    if not frames:
+        return pd.DataFrame(), failed
+    assembled = pd.concat([df for (_t, df) in frames], axis=1, keys=[_t for _t, df in frames])
+    return assembled, failed
 
-# ------------- 3. Strategy Engine (analyze ticker) -------------
 def extract_stock_df_from_bulk(data: pd.DataFrame, ticker: str):
     """
-    Given the bulk yfinance output and a ticker, try robust extraction for:
-      - MultiIndex with ticker at level 0 or level 1
-      - Single-level DataFrame (single ticker download)
-    Returns a DataFrame for that ticker or raises KeyError.
+    Robustly extract a per-ticker DataFrame from bulk yfinance download, handling MultiIndex shapes.
     """
     if data is None or data.empty:
-        raise KeyError(f"No data available for {ticker}")
-
-    # If multiindex columns:
+        raise KeyError("No data")
     if isinstance(data.columns, pd.MultiIndex):
-        # Find which level contains the ticker
-        # Two common shapes:
-        # - level 0: ticker, level 1: fields (('AAPL','Close'))
-        # - level 1: ticker, level 0: fields (('Close','AAPL'))
-        levels = [list(level) for level in data.columns.levels]
-        # Try common arrangement: level 0 == tickers
-        if ticker in levels[0]:
-            try:
-                df = data.xs(ticker, axis=1, level=0, drop_level=True)
-                return df
-            except Exception:
-                pass
+        # Try ticker in level 0
+        if ticker in data.columns.levels[0]:
+            return data.xs(ticker, axis=1, level=0, drop_level=True)
         # Try ticker in level 1
-        if ticker in levels[1]:
-            try:
-                df = data.xs(ticker, axis=1, level=1, drop_level=True)
-                return df
-            except Exception:
-                pass
-        # If not found, try to detect where ticker text appears
-        for lvl in range(len(levels)):
-            if any(str(x) == ticker for x in levels[lvl]):
-                df = data.xs(ticker, axis=1, level=lvl, drop_level=True)
-                return df
-        # didn't find it
-        raise KeyError(f"Ticker {ticker} not present in MultiIndex columns.")
+        if ticker in data.columns.levels[1]:
+            return data.xs(ticker, axis=1, level=1, drop_level=True)
+        # Last resort: search levels for str equality
+        for lvl in range(len(data.columns.levels)):
+            if any(str(x) == ticker for x in data.columns.levels[lvl]):
+                return data.xs(ticker, axis=1, level=lvl, drop_level=True)
+        raise KeyError(f"{ticker} not found in MultiIndex columns")
     else:
-        # single dataframe (either single-ticker download or one-field)
+        # single-ticker download
         return data
 
+# ---------------- Strategy / Indicators ----------------
 def analyze_ticker(ticker: str, df: pd.DataFrame):
     """
-    Returns (score:int, reasons:list)
-    Keep analysis defensive and log errors for GitHub logs.
+    Returns (score:int, reasons:list). Defensive: returns 0 + reason if any issue.
     """
     try:
-        # Defensive copy
         df = df.copy()
-        # Make sure columns are simple names
+        # flatten multiindex columns if present
         if isinstance(df.columns, pd.MultiIndex):
             df.columns = [c[0] if isinstance(c, tuple) else c for c in df.columns]
-        # Remove NA rows
         df = df.dropna()
-        if len(df) < 250:
-            return 0, ["Insufficient data (<250 rows)"]
+        if len(df) < MIN_DATA_ROWS:
+            return 0, [f"Insufficient data (<{MIN_DATA_ROWS})"]
 
-        # Ensure existence of columns
-        for needed in ['Close', 'High', 'Low', 'Volume']:
-            if needed not in df.columns:
-                return 0, [f"Missing column {needed}"]
+        # ensure required columns
+        for col in ['Close', 'High', 'Low', 'Volume']:
+            if col not in df.columns:
+                return 0, [f"Missing column {col}"]
 
         last_price = float(df['Close'].iloc[-1])
         if last_price < 1.00:
@@ -210,21 +181,20 @@ def analyze_ticker(ticker: str, df: pd.DataFrame):
         high = df['High']
         low = df['Low']
 
-        # Indicators
+        # indicators
         sma_21 = ta.sma(close, length=21)
         sma_55 = ta.sma(close, length=55)
         sma_233 = ta.sma(close, length=233)
         macd = ta.macd(close)
         hist = macd.get('MACDh_12_26_9') if isinstance(macd, dict) else macd['MACDh_12_26_9']
         dmi = ta.adx(high, low, close, length=14)
-        adx = dmi['ADX_14']
         pos_di = dmi['DMP_14']
         neg_di = dmi['DMN_14']
 
-        # Score
         score = 0
         reasons = []
 
+        # Perfect fib trend grants 30 points
         try:
             if last_price > sma_21.iloc[-1] > sma_55.iloc[-1] > sma_233.iloc[-1]:
                 score += 30
@@ -235,6 +205,7 @@ def analyze_ticker(ticker: str, df: pd.DataFrame):
         except Exception:
             reasons.append("SMA calc issue")
 
+        # MACD rising grants 20
         try:
             if hist is not None and len(hist) >= 2:
                 if hist.iloc[-1] > 0 and hist.iloc[-1] > hist.iloc[-2]:
@@ -243,6 +214,7 @@ def analyze_ticker(ticker: str, df: pd.DataFrame):
         except Exception:
             reasons.append("MACD calc issue")
 
+        # Positive DMI grants 20
         try:
             if pos_di.iloc[-1] > neg_di.iloc[-1]:
                 score += 20
@@ -253,29 +225,32 @@ def analyze_ticker(ticker: str, df: pd.DataFrame):
         print(f"🔍 {ticker} Score: {score} | Price: {last_price:.2f} | Reasons: {reasons}")
         return score, reasons
     except Exception as e:
-        print(f"❌ CRASH on {ticker}: {e}\n{traceback.format_exc()}")
-        return 0, [f"Analyzer crashed: {e}"]
+        print(f"❌ Analyzer crash for {ticker}: {e}\n{traceback.format_exc()}")
+        return 0, [f"Analyzer crash: {e}"]
 
-# ------------- 4. Gemini fundamental analysis -------------
-def get_gemini_analysis(ticker):
+# ---------------- Gemini / AI ----------------
+def get_gemini_analysis(ticker, active_model=AI_PRIMARY_MODEL):
     """
-    Returns the string response from Gemini or an error message.
-    Keeps retry logic and defensive behavior.
+    Attempts to obtain a short Gemini analysis for the ticker.
+    Will try 'active_model' (string). Caller should implement retries and fallback logic.
+    Returns (success:bool, text:str)
     """
+    if not GENAI_API_KEY:
+        return False, "Gemini API key missing; skipping AI analysis."
+
     try:
         stock = yf.Ticker(ticker)
         info = stock.info or {}
-        def get_val(k): return info.get(k, 'N/A')
-
+        def g(k): return info.get(k, 'N/A')
         fund_data = {
             "Symbol": ticker,
-            "Sector": get_val('sector'),
-            "Forward PE": get_val('forwardPE'),
-            "PEG Ratio": get_val('pegRatio'),
-            "Profit Margins": get_val('profitMargins'),
-            "Revenue Growth": get_val('revenueGrowth'),
-            "Target Price": get_val('targetMeanPrice'),
-            "Current Price": get_val('currentPrice')
+            "Sector": g('sector'),
+            "Forward PE": g('forwardPE'),
+            "PEG Ratio": g('pegRatio'),
+            "Profit Margins": g('profitMargins'),
+            "Revenue Growth": g('revenueGrowth'),
+            "Target Price": g('targetMeanPrice'),
+            "Current Price": g('currentPrice')
         }
 
         prompt = f"""
@@ -290,139 +265,158 @@ Please analyze this stock in under 50 words.
 2. Is this a real company or a junk stock?
 3. Final Verdict: "CONVICTION BUY", "SPECULATIVE BUY", or "TRAP/AVOID".
 """
-        if not GENAI_API_KEY:
-            return "Gemini API key missing; skipping AI analysis."
 
-        model = genai.GenerativeModel('gemini-1.5-flash')
-        for attempt in range(3):
-            try:
-                response = model.generate_content(prompt)
-                return response.text.strip()
-            except Exception as e:
-                print(f"   ⚠️ Gemini attempt {attempt+1} failed: {e}")
-                time.sleep(2)
-        return "AI Analysis Failed after 3 retries."
+        model = genai.GenerativeModel(active_model)
+        response = model.generate_content(prompt)
+        text = response.text.strip() if hasattr(response, "text") else str(response).strip()
+        return True, text
     except Exception as e:
-        return f"AI Analysis Failed: {e}"
+        return False, f"AI error with model {active_model}: {e}"
 
-# ------------- 5. Main Execution -------------
+# ---------------- Main ----------------
 def run_scanner():
     started_at = datetime.datetime.utcnow().isoformat() + "Z"
-    print(f"🚀 Starting market scan at {started_at}")
-    # 1) Send immediate startup email to verify SMTP and runner
-    startup_subject = f"[Scanner Startup] {datetime.datetime.utcnow().date()} - Market Scanner starting"
-    startup_body = f"Market scanner started at UTC {started_at}.\nIf you see this email, SMTP worked from this runner.\n\nHostname/Runner logs are available in GitHub Actions logs."
-    send_email(startup_subject, startup_body)
+    print(f"🚀 Market scan starting at {started_at}")
 
-    all_tickers = get_all_tickers()
-    # For initial testing, you may restrict tickers_to_scan to a smaller slice,
-    # then uncomment full list after you confirm startup works.
-    tickers_to_scan = all_tickers  # change if you want a subset for testing
-
-    # Tune these for rate limiting
-    chunk_size = 30             # reduce from 100 to avoid Yahoo rate limit
-    sleep_between_chunks = 1.5  # seconds to sleep between chunk downloads
-    sleep_between_ai = 5        # sleep between Gemini calls to be gentle
-    high_conviction_list = []
+    tickers = get_all_tickers()
+    total = len(tickers)
+    high_conviction = []
     failed_downloads = set()
     failed_analysis = set()
 
-    total = len(tickers_to_scan)
-    print(f"📊 Scanning {total} stocks in chunks of {chunk_size}...")
+    # AI state
+    consecutive_ai_failures = 0
+    ai_disabled = False
 
-    # iterate chunks
-    for i in range(0, total, chunk_size):
-        chunk = tickers_to_scan[i:i+chunk_size]
-        print(f"\n--- Processing chunk {i//chunk_size + 1} / {((total-1)//chunk_size)+1} (size {len(chunk)}) ---")
+    print(f"📊 Scanning {total} tickers in chunks of {CHUNK_SIZE} (threshold={TECHNICAL_SCORE_THRESHOLD})")
+    for i in range(0, total, CHUNK_SIZE):
+        chunk = tickers[i:i+CHUNK_SIZE]
+        print(f"\n--- chunk {i//CHUNK_SIZE + 1} / {((total-1)//CHUNK_SIZE)+1} (size {len(chunk)}) ---")
         data, failed = get_data_bulk(chunk)
-        # record any failed tickers
         failed_downloads.update(failed)
         if data is None or (isinstance(data, pd.DataFrame) and data.empty):
-            print("   ⚠️ Chunk returned no data; marking all chunk tickers as failed and continuing.")
+            print("   ⚠️ Empty chunk; marking chunk tickers as failed and continuing.")
             failed_downloads.update(chunk)
-            time.sleep(sleep_between_chunks)
+            time.sleep(SLEEP_BETWEEN_CHUNKS)
             continue
 
-        # analyze each ticker in chunk
         for ticker in chunk:
             try:
                 try:
                     stock_df = extract_stock_df_from_bulk(data, ticker)
                 except KeyError as e:
-                    # not present in bulk result
                     failed_downloads.add(ticker)
-                    print(f"   ⚠️ {ticker} missing from bulk data: {e}")
+                    print(f"   ⚠️ {ticker} missing in data: {e}")
                     continue
 
                 score, reasons = analyze_ticker(ticker, stock_df)
-                if score >= 10:
-                    price = None
+                if score >= TECHNICAL_SCORE_THRESHOLD:
+                    price = 'N/A'
                     try:
                         price = float(stock_df['Close'].iloc[-1])
                     except Exception:
-                        price = 'N/A'
-                    high_conviction_list.append({
+                        pass
+                    high_conviction.append({
                         "ticker": ticker,
                         "score": score,
                         "price": price,
                         "reasons": reasons
                     })
             except Exception as e:
-                print(f"   ❌ Unexpected error while processing {ticker}: {e}\n{traceback.format_exc()}")
                 failed_analysis.add(ticker)
+                print(f"   ❌ Error while processing {ticker}: {e}\n{traceback.format_exc()}")
                 continue
 
-        # be gentle to avoid rate limit
-        time.sleep(sleep_between_chunks)
+        time.sleep(SLEEP_BETWEEN_CHUNKS)
 
-    match_count = len(high_conviction_list)
-    print(f"\n🎯 Technical Scan Complete. Found {match_count} stocks with Score >= 10%.")
+    match_count = len(high_conviction)
+    print(f"\n🎯 Scan complete. {match_count} stocks met the threshold >= {TECHNICAL_SCORE_THRESHOLD}.")
 
-    # sort results
-    high_conviction_list.sort(key=lambda x: x['score'], reverse=True)
+    # Sort by score desc
+    high_conviction.sort(key=lambda x: x['score'], reverse=True)
 
     # Build email body
-    email_body = f"☀️ HIGH CONVICTION REPORT: {datetime.date.today()}\n"
-    email_body += f"Started at (UTC): {started_at}\n"
-    email_body += f"Scanned {total} tickers in chunks of {chunk_size}.\n"
-    email_body += f"Found {match_count} stocks with Technical Score >= 10%\n"
-    email_body += "\n========================================\n\n"
+    body = []
+    body.append(f"HIGH CONVICTION REPORT: {datetime.date.today()}")
+    body.append(f"Started: {started_at} (UTC)")
+    body.append(f"Scanned {total} tickers in chunks of {CHUNK_SIZE}")
+    body.append(f"Threshold: {TECHNICAL_SCORE_THRESHOLD}")
+    body.append(f"Matches found: {match_count}")
+    body.append("\n========================================\n")
 
+    # If there are matches and AI is enabled, attempt Gemini analysis with fallback
+    ai_used = False
+    if match_count > 0 and not ai_disabled:
+        for idx, s in enumerate(high_conviction, start=1):
+            ticker = s['ticker']
+            body.append(f"{idx}. {ticker} (Score: {s['score']})")
+            body.append(f"   Price: {s['price']}")
+            body.append(f"   Signals: {', '.join(s['reasons'])}")
+
+            # If AI has been disabled due to many failures, skip
+            if consecutive_ai_failures >= AI_MAX_CONSECUTIVE_FAILURES:
+                ai_disabled = True
+                body.append("   AI disabled due to repeated failures. Skipping Gemini analysis.\n")
+                continue
+
+            # Try primary model, then fallback model if primary fails
+            success = False
+            ai_text = "AI not configured."
+            for model_name in (AI_PRIMARY_MODEL, AI_FALLBACK_MODEL):
+                for attempt in range(AI_MAX_RETRIES):
+                    ok, txt = get_gemini_analysis(ticker, active_model=model_name)
+                    if ok:
+                        success = True
+                        ai_text = txt
+                        break
+                    else:
+                        print(f"   ⚠️ Gemini {model_name} attempt {attempt+1} failed for {ticker}: {txt}")
+                        time.sleep(1 + attempt)
+                if success:
+                    ai_used = True
+                    break
+                else:
+                    print(f"   ↳ Model {model_name} failed for {ticker}; trying next model if available.")
+
+            if not success:
+                consecutive_ai_failures += 1
+                body.append(f"   🧠 Gemini analysis failed for {ticker} (consecutive AI failures: {consecutive_ai_failures}).\n")
+                if consecutive_ai_failures >= AI_MAX_CONSECUTIVE_FAILURES:
+                    body.append("   🛑 Reached maximum consecutive AI failures; future tickers will skip AI.\n")
+            else:
+                consecutive_ai_failures = 0
+                body.append("   🧠 Gemini Verdict:\n")
+                # indent AI text
+                for line in ai_text.splitlines():
+                    body.append(f"      {line}")
+                body.append("")
+
+            time.sleep(SLEEP_BETWEEN_AI)
+
+    # If no matches or AI disabled/skipped, still show technical list
     if match_count == 0:
-        email_body += "No matches found today.\n\n"
+        body.append("No matches passed the technical threshold today.\n")
 
-    # Gemini analysis for each match
-    for i, stock in enumerate(high_conviction_list):
-        print(f"   ({i+1}/{match_count}) Analyzing {stock['ticker']} fundamentals via Gemini...")
-        ai_verdict = get_gemini_analysis(stock['ticker'])
-        email_body += f"🚀 {stock['ticker']} (Score: {stock['score']})\n"
-        email_body += f"   Price: {stock['price']}\n"
-        email_body += f"   Signals: {', '.join(stock['reasons'])}\n"
-        email_body += f"   🧠 Gemini Verdict:\n   {ai_verdict}\n"
-        email_body += "----------------------------------------\n\n"
-        time.sleep(sleep_between_ai)
-
-    # Append diagnostics
-    email_body += "\n\nDIAGNOSTICS / FAILED ITEMS\n"
-    email_body += "-------------------------\n"
-    email_body += f"Failed chunk downloads or missing tickers: {len(failed_downloads)}\n"
+    # Diagnostics
+    body.append("\n--- DIAGNOSTICS ---")
+    body.append(f"Failed downloads / missing tickers: {len(failed_downloads)}")
     if failed_downloads:
-        email_body += ", ".join(sorted(list(failed_downloads))[:200])  # cap long list
-        if len(failed_downloads) > 200:
-            email_body += f"... (+{len(failed_downloads)-200} more)\n"
-    email_body += "\n\nTickers that crashed during analysis: {}\n".format(len(failed_analysis))
+        body.append(", ".join(sorted(list(failed_downloads))[:200]) + ("" if len(failed_downloads) <= 200 else f"... (+{len(failed_downloads)-200} more)"))
+    body.append(f"Tickers that crashed during analysis: {len(failed_analysis)}")
     if failed_analysis:
-        email_body += ", ".join(sorted(list(failed_analysis))[:200])
-        if len(failed_analysis) > 200:
-            email_body += f"... (+{len(failed_analysis)-200} more)\n"
+        body.append(", ".join(sorted(list(failed_analysis))[:200]) + ("" if len(failed_analysis) <= 200 else f"... (+{len(failed_analysis)-200} more)"))
+    body.append(f"AI used: {'Yes' if ai_used else 'No'}")
+    body.append(f"AI disabled due to consecutive failures: {'Yes' if consecutive_ai_failures >= AI_MAX_CONSECUTIVE_FAILURES else 'No'}")
 
-    # Subject mirrors matches
-    subject = f"🚀 {match_count} High-Conviction Breakouts (>=10%)" if match_count else f"⚠️ MARKET SCAN: 0 Matches Found ({datetime.date.today()})"
+    final_body = "\n".join(body)
+    subject = f"🚀 {match_count} High-Conviction Breakouts (>= {TECHNICAL_SCORE_THRESHOLD})" if match_count else f"⚠️ MARKET SCAN: 0 Matches ({datetime.date.today()})"
 
-    # final send
-    send_ok = send_email(subject, email_body)
-    if not send_ok:
-        print("❌ Final report failed to send; check EMAIL credentials and logs.")
+    # Send final report
+    sent = send_email(subject, final_body)
+    if not sent:
+        print("❌ Final report failed to send; please check EMAIL_* secrets and Action logs.")
+    else:
+        print("✅ Final report sent (or at least an attempt was made).")
 
 if __name__ == "__main__":
     run_scanner()
