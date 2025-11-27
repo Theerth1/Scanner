@@ -201,17 +201,25 @@ def validate_with_gemini(candidates: List[Dict], api_key: str) -> List[Dict]:
     
     # Try models in order
     model = None
-    for model_name in ['gemini-1.5-flash', 'gemini-pro']:
+    ai_available = False
+    for model_name in ['gemini-1.5-flash', 'gemini-1.5-pro', 'gemini-pro']:
         try:
             model = genai.GenerativeModel(model_name)
-            model.generate_content("test")
-            print(f"Using: {model_name}")
-            break
-        except:
+            # Test with actual generation
+            test_response = model.generate_content("Say 'OK'")
+            if test_response and test_response.text:
+                print(f"Using: {model_name}")
+                ai_available = True
+                break
+        except Exception as e:
+            print(f"Model {model_name} failed: {str(e)[:50]}")
             continue
     
-    if not model:
-        print("AI unavailable - returning technical results only")
+    if not ai_available:
+        print("⚠️ AI unavailable - returning technical results only")
+        for candidate in candidates:
+            candidate['ai_analysis'] = "AI unavailable on this runner"
+            candidate['fundamentals'] = get_fundamental_data(candidate['ticker'])
         return candidates
     
     validated = []
@@ -256,13 +264,13 @@ def send_email_report(results: List[Dict], email_config: Dict):
     print("\nSending email...")
     
     msg = MIMEMultipart('alternative')
-    msg['Subject'] = f"Catos Scanner - {datetime.now().strftime('%Y-%m-%d')}"
+    msg['Subject'] = f"Morning Scanner Report - {datetime.now().strftime('%Y-%m-%d')}"
     msg['From'] = email_config['sender']
     msg['To'] = email_config['receiver']
     
     if not results:
         body = f"""<html><body>
-<h2>Catos Scanner Report</h2>
+<h2>Morning Scanner Report</h2>
 <p>Date: {datetime.now().strftime('%Y-%m-%d %H:%M UTC')}</p>
 <p>Status: ✅ Scan completed</p>
 <p>Results: No stocks met criteria (Score > {MIN_SCORE}%)</p>
@@ -288,7 +296,7 @@ def send_email_report(results: List[Dict], email_config: Dict):
 </div>"""
         
         body = f"""<html><body>
-<h2>Catos Scanner Report</h2>
+<h2>Morning Scanner Report</h2>
 <p>Date: {datetime.now().strftime('%Y-%m-%d %H:%M UTC')}</p>
 <p>Matches: {len(results)}</p>
 <hr>{stocks_html}</body></html>"""
