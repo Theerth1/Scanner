@@ -1,416 +1,481 @@
-#!/usr/bin/env python3
 """
-market_scanner.py
-
-Features:
-- SMA-only stacking logic (SMA21 > SMA55 > SMA233 or SMA55 > SMA233)
-- Robust yfinance chunking + retries + per-ticker fallback
-- Defensive Gemini usage: detects model-not-found 404 and disables AI globally
-- Limits number of Gemini analyses per run (AI_ANALYSIS_CAP)
-- Sends a final email report (always)
+Catos Method Stock Scanner - Based on Actual TradingView Setup
+Designed for GitHub Actions with robust error handling
 """
 
 import os
 import time
-import datetime
-import traceback
-import io
-import requests
+import smtplib
 import yfinance as yf
 import pandas as pd
-import pandas_ta_classic as ta
-import google.generativeai as genai
-import smtplib
+import numpy as np
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
+from datetime import datetime
+import google.generativeai as genai
+from typing import List, Dict, Tuple
+import pandas_ta_classic as ta
+import traceback
 
-# ---------------- CONFIG (env / tuning) ----------------
-GENAI_API_KEY = os.environ.get("GENAI_API_KEY")
-EMAIL_SENDER = os.environ.get("EMAIL_SENDER")
-EMAIL_PASSWORD = os.environ.get("EMAIL_PASSWORD")
-EMAIL_RECEIVER = os.environ.get("EMAIL_RECEIVER")
+# Configuration
+CHUNK_SIZE = 30
+CHUNK_DELAY = 1.5
+MIN_SCORE = 70
+LOOKBACK_DAYS = 250  # ~1 year of data
 
-CHUNK_SIZE = int(os.environ.get("CHUNK_SIZE", 30))
-SLEEP_BETWEEN_CHUNKS = float(os.environ.get("SLEEP_BETWEEN_CHUNKS", 1.5))
-SLEEP_BETWEEN_AI = float(os.environ.get("SLEEP_BETWEEN_AI", 5))
-MIN_DATA_ROWS = int(os.environ.get("MIN_DATA_ROWS", 250))
 
-# Technical threshold (only SMAs + MACD/DMI scoring). Example set to 70 previously.
-TECHNICAL_SCORE_THRESHOLD = int(os.environ.get("TECHNICAL_SCORE_THRESHOLD", 70))
-
-# AI configuration
-AI_PRIMARY_MODEL = os.environ.get("AI_PRIMARY_MODEL", "gemini-1.5-flash")
-AI_FALLBACK_MODEL = os.environ.get("AI_FALLBACK_MODEL", "gemini-pro")
-AI_MAX_RETRIES = int(os.environ.get("AI_MAX_RETRIES", 3))
-AI_MAX_CONSECUTIVE_FAILURES = int(os.environ.get("AI_MAX_CONSECUTIVE_FAILURES", 5))
-
-# IMPORTANT: cap how many matches will be sent to Gemini in one run to avoid long runtimes / rate limits
-AI_ANALYSIS_CAP = int(os.environ.get("AI_ANALYSIS_CAP", 25))  # change to suit your quota
-
-# ---------------- Initialize Gemini client if key present ----------------
-if GENAI_API_KEY:
+def get_all_tickers() -> List[str]:
+    """
+    Get all NYSE and NASDAQ tickers.
+    Returns a filtered list of valid stock symbols.
+    """
+    print("Fetching ticker list...")
+    
+    # Get tickers from major indices as a robust starting point
+    sp500_url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
+    nasdaq_url = "https://en.wikipedia.org/wiki/NASDAQ-100"
+    
+    tickers = set()
+    
     try:
-        genai.configure(api_key=GENAI_API_KEY)
+        # S&P 500
+        sp500_table = pd.read_html(sp500_url)[0]
+        tickers.update(sp500_table['Symbol'].tolist())
+        
+        # NASDAQ 100
+        nasdaq_table = pd.read_html(nasdaq_url)[4]
+        nasdaq_tickers = nasdaq_table['Ticker'].tolist()
+        tickers.update(nasdaq_tickers)
+        
     except Exception as e:
-        print(f"⚠️ Warning configuring Gemini client: {e}")
-
-# ---------------- Email helper ----------------
-def send_email(subject: str, body: str) -> bool:
-    msg = MIMEMultipart()
-    msg['From'] = EMAIL_SENDER or "unknown"
-    msg['To'] = EMAIL_RECEIVER or "unknown"
-    msg['Subject'] = subject
-    msg.attach(MIMEText(body, 'plain'))
-
-    try:
-        if not all([EMAIL_SENDER, EMAIL_PASSWORD, EMAIL_RECEIVER]):
-            raise ValueError("Missing EMAIL_SENDER/EMAIL_PASSWORD/EMAIL_RECEIVER environment variables.")
-        server = smtplib.SMTP('smtp.gmail.com', 587, timeout=60)
-        server.ehlo()
-        server.starttls()
-        server.login(EMAIL_SENDER, EMAIL_PASSWORD)
-        server.sendmail(EMAIL_SENDER, EMAIL_RECEIVER, msg.as_string())
-        server.quit()
-        print("✅ Email sent.")
-        return True
-    except Exception as e:
-        print(f"❌ Email failed: {e}")
-        return False
-
-# ---------------- Tickers list ----------------
-def get_all_tickers():
-    print("🌍 Fetching full market ticker list...")
-    try:
-        url = "https://raw.githubusercontent.com/rreichel3/US-Stock-Symbols/main/all/all_tickers.txt"
-        s = requests.get(url, timeout=30).content
-        tickers = pd.read_csv(io.StringIO(s.decode('utf-8')), header=None)[0].tolist()
-        clean = [t for t in tickers if isinstance(t, str) and "^" not in t and "." not in t]
-        print(f"✅ Found {len(clean)} tickers.")
-        return clean
-    except Exception as e:
-        print(f"⚠️ Failed to fetch tickers: {e}. Using fallback.")
-        return ['AAPL','NVDA','AMD','TSLA','MSFT']
-
-# ---------------- Bulk downloader ----------------
-def get_data_bulk(tickers, period="2y", max_retries=3):
-    failed = []
-    attempt = 0
-    while attempt < max_retries:
-        try:
-            print(f"   ↳ Downloading chunk size={len(tickers)}, attempt {attempt+1}")
-            data = yf.download(tickers, period=period, group_by='ticker', progress=False, threads=True)
-            if data is None or (isinstance(data, pd.DataFrame) and data.empty):
-                raise ValueError("Empty result from yfinance")
-            return data, failed
-        except Exception as e:
-            print(f"   ⚠️ Chunk download attempt {attempt+1} failed: {e}")
-            attempt += 1
-            time.sleep(1 + attempt)
-
-    # fallback to single-ticker downloads
-    print("   ↳ Chunk retries exhausted; falling back to single-ticker downloads.")
-    frames = []
+        print(f"Warning: Could not fetch from Wikipedia: {e}")
+    
+    # Add additional common tickers
+    additional = [
+        'AAPL', 'MSFT', 'GOOGL', 'AMZN', 'NVDA', 'META', 'TSLA', 'BRK.B',
+        'V', 'UNH', 'XOM', 'JNJ', 'WMT', 'JPM', 'MA', 'PG', 'AVGO', 'HD',
+        'CVX', 'MRK', 'ABBV', 'COST', 'PEP', 'KO', 'LLY', 'ADBE', 'TMO',
+        'CSCO', 'MCD', 'ACN', 'NKE', 'DHR', 'ABT', 'VZ', 'TXN', 'ORCL',
+        'AMD', 'NFLX', 'INTC', 'QCOM', 'CRM', 'WFC', 'CMCSA', 'INTU',
+        'IBM', 'BA', 'CAT', 'GS', 'HON', 'SBUX', 'MMM', 'AXP', 'GE'
+    ]
+    tickers.update(additional)
+    
+    # Clean up tickers
+    cleaned = []
     for t in tickers:
-        try:
-            single = yf.download(t, period=period, progress=False, threads=False)
-            if single is None or single.empty:
-                failed.append(t)
-                continue
-            frames.append((t, single))
-            time.sleep(1.0)
-        except Exception as e:
-            print(f"   ⚠️ Single download failed for {t}: {e}")
-            failed.append(t)
-    if not frames:
-        return pd.DataFrame(), failed
-    assembled = pd.concat([df for (_t, df) in frames], axis=1, keys=[_t for _t, df in frames])
-    return assembled, failed
+        t = t.strip().upper()
+        if t and not any(char in t for char in ['/', '^', '=']):
+            cleaned.append(t)
+    
+    print(f"Total tickers to scan: {len(cleaned)}")
+    return sorted(list(cleaned))
 
-# ---------------- Extract per-ticker DataFrame ----------------
-def extract_stock_df_from_bulk(data: pd.DataFrame, ticker: str):
-    if data is None or data.empty:
-        raise KeyError("No data")
-    if isinstance(data.columns, pd.MultiIndex):
-        # Try common placements
-        if ticker in data.columns.levels[0]:
-            return data.xs(ticker, axis=1, level=0, drop_level=True)
-        if ticker in data.columns.levels[1]:
-            return data.xs(ticker, axis=1, level=1, drop_level=True)
-        # search levels
-        for lvl in range(len(data.columns.levels)):
-            if any(str(x) == ticker for x in data.columns.levels[lvl]):
-                return data.xs(ticker, axis=1, level=lvl, drop_level=True)
-        raise KeyError(f"{ticker} not found in MultiIndex columns")
-    else:
-        return data
 
-# ---------------- Strategy: analyze_ticker ----------------
-def analyze_ticker(ticker: str, df: pd.DataFrame):
+def download_data_in_chunks(tickers: List[str]) -> pd.DataFrame:
     """
-    SMA-only ordering (no price check):
-      - If SMA21 > SMA55 > SMA233 -> +30 (Perfect stack)
-      - Elif SMA55 > SMA233 -> +10
-    Plus MACD (+20) and DMI (+20).
+    Download stock data in chunks to avoid Yahoo Finance bans.
+    Handles MultiIndex columns from yfinance.
     """
-    try:
-        df = df.copy()
-        if isinstance(df.columns, pd.MultiIndex):
-            df.columns = [c[0] if isinstance(c, tuple) else c for c in df.columns]
-
-        # conservative approach: do not drop all NaNs (drop rows where close is NaN)
-        df = df[df['Close'].notna()] if 'Close' in df.columns else df.dropna()
-        if len(df) < MIN_DATA_ROWS:
-            return 0, [f"Insufficient data (<{MIN_DATA_ROWS})"]
-
-        for col in ['Close','High','Low','Volume']:
-            if col not in df.columns:
-                return 0, [f"Missing column {col}"]
-
-        close = df['Close']
-        high = df['High']
-        low = df['Low']
-
-        # indicators
-        sma_21 = ta.sma(close, length=21)
-        sma_55 = ta.sma(close, length=55)
-        sma_233 = ta.sma(close, length=233)
-
-        macd = ta.macd(close)
-        hist = macd.get('MACDh_12_26_9') if isinstance(macd, dict) else macd['MACDh_12_26_9']
-
-        dmi = ta.adx(high, low, close, length=14)
-        pos_di = dmi['DMP_14']
-        neg_di = dmi['DMN_14']
-
-        # Extract current SMA values safely
-        s21 = sma_21.iloc[-1] if len(sma_21) > 0 else float('nan')
-        s55 = sma_55.iloc[-1] if len(sma_55) > 0 else float('nan')
-        s233 = sma_233.iloc[-1] if len(sma_233) > 0 else float('nan')
-
-        score = 0
-        reasons = []
-
-        # SMA-only checks (price is NOT considered)
-        if pd.notna(s21) and pd.notna(s55) and pd.notna(s233):
-            if s21 > s55 > s233:
-                score += 30
-                reasons.append("Perfect SMA Stack (21 > 55 > 233)")
-            elif s55 > s233:
-                score += 10
-                reasons.append("55 Above 233")
-        else:
-            missing = []
-            if not pd.notna(s21): missing.append("SMA21")
-            if not pd.notna(s55): missing.append("SMA55")
-            if not pd.notna(s233): missing.append("SMA233")
-            reasons.append(f"Missing SMAs: {', '.join(missing)}")
-
-        # MACD
-        try:
-            if hist is not None and len(hist) >= 2:
-                if hist.iloc[-1] > 0 and hist.iloc[-1] > hist.iloc[-2]:
-                    score += 20
-                    reasons.append("MACD Rising")
-        except Exception:
-            reasons.append("MACD calc issue")
-
-        # DMI
-        try:
-            if pos_di.iloc[-1] > neg_di.iloc[-1]:
-                score += 20
-                reasons.append("Positive DMI")
-        except Exception:
-            reasons.append("DMI calc issue")
-
-        print(f"🔍 {ticker} Score: {score} | Reasons: {reasons}")
-        return score, reasons
-
-    except Exception as e:
-        print(f"❌ Analyzer crash for {ticker}: {e}\n{traceback.format_exc()}")
-        return 0, [f"Analyzer crash: {e}"]
-
-# ---------------- Gemini analysis (defensive) ----------------
-def get_gemini_analysis(ticker):
-    global AI_DISABLED
-    if AI_DISABLED: return "AI Analysis Skipped (Too many errors)"
-
-    try:
-        # Try primary model (1.5 Flash)
-        model = genai.GenerativeModel('gemini-1.5-flash')
-        prompt = f"Analyze {ticker} for a breakout or continuation trade. Verdict: BUY or AVOID? Keep it under 50 words."
+    print(f"\nDownloading data in chunks of {CHUNK_SIZE}...")
+    all_data = {}
+    
+    for i in range(0, len(tickers), CHUNK_SIZE):
+        chunk = tickers[i:i + CHUNK_SIZE]
+        print(f"Chunk {i//CHUNK_SIZE + 1}/{(len(tickers)-1)//CHUNK_SIZE + 1}: {len(chunk)} tickers")
         
         try:
-            response = model.generate_content(prompt)
-            return response.text.strip()
-        except Exception as e:
-            # CATCH THE 404 ERROR
-            if "404" in str(e) or "not found" in str(e):
-                print("⚠️ 1.5 Flash not found, using fallback model...")
-                try:
-                    # Fallback to the older Pro model if Flash fails
-                    model = genai.GenerativeModel('gemini-pro')
-                    response = model.generate_content(prompt)
-                    return response.text.strip()
-                except:
-                    return "AI Fallback Failed"
-            raise e
-
-    except Exception as e:
-        print(f"⚠️ AI Error on {ticker}: {e}")
-        return "AI Unavailable"
-# ---------------- Main run ----------------
-def run_scanner():
-    started_at = datetime.datetime.utcnow().isoformat() + "Z"
-    print(f"🚀 Market scan starting at {started_at}")
-
-    all_tickers = get_all_tickers()
-    total = len(all_tickers)
-    high_conviction = []
-    failed_downloads = set()
-    failed_analysis = set()
-
-    for i in range(0, total, CHUNK_SIZE):
-        chunk = all_tickers[i:i+CHUNK_SIZE]
-        print(f"\n--- chunk {i//CHUNK_SIZE + 1} / {((total-1)//CHUNK_SIZE)+1} (size {len(chunk)}) ---")
-        data, failed = get_data_bulk(chunk)
-        failed_downloads.update(failed)
-        if data is None or (isinstance(data, pd.DataFrame) and data.empty):
-            print("   ⚠️ Chunk returned no data; marking them as failed.")
-            failed_downloads.update(chunk)
-            time.sleep(SLEEP_BETWEEN_CHUNKS)
-            continue
-
-        for ticker in chunk:
-            try:
-                try:
-                    stock_df = extract_stock_df_from_bulk(data, ticker)
-                except KeyError as e:
-                    failed_downloads.add(ticker)
-                    print(f"   ⚠️ {ticker} missing in bulk data: {e}")
-                    continue
-
-                score, reasons = analyze_ticker(ticker, stock_df)
-                if score >= TECHNICAL_SCORE_THRESHOLD:
-                    price = 'N/A'
+            data = yf.download(
+                chunk,
+                period='1y',
+                interval='1d',
+                group_by='ticker',
+                auto_adjust=True,
+                progress=False,
+                threads=True
+            )
+            
+            # Handle both single and multiple tickers
+            if len(chunk) == 1:
+                ticker = chunk[0]
+                if not data.empty:
+                    all_data[ticker] = data
+            else:
+                # MultiIndex: (Ticker, OHLCV)
+                for ticker in chunk:
                     try:
-                        price = float(stock_df['Close'].iloc[-1])
-                    except Exception:
-                        pass
-                    high_conviction.append({
-                        "ticker": ticker,
-                        "score": score,
-                        "price": price,
-                        "reasons": reasons
-                    })
-            except Exception as e:
-                failed_analysis.add(ticker)
-                print(f"   ❌ Processing error for {ticker}: {e}\n{traceback.format_exc()}")
-                continue
-
-        time.sleep(SLEEP_BETWEEN_CHUNKS)
-
-    match_count = len(high_conviction)
-    print(f"\n🎯 Scan complete. {match_count} tickers met threshold >= {TECHNICAL_SCORE_THRESHOLD}.")
-
-    high_conviction.sort(key=lambda x: x['score'], reverse=True)
-
-    # Build email body
-    lines = []
-    lines.append(f"HIGH CONVICTION REPORT: {datetime.date.today()}")
-    lines.append(f"Started: {started_at} (UTC)")
-    lines.append(f"Scanned {total} tickers in chunks of {CHUNK_SIZE}")
-    lines.append(f"Threshold: {TECHNICAL_SCORE_THRESHOLD}")
-    lines.append(f"Matches found: {match_count}")
-    lines.append("\n========================================\n")
-
-    # AI variables
-    ai_disabled = False
-    consecutive_ai_failures = 0
-    ai_used = False
-    ai_count = 0
-
-    # Iterate matches and attempt Gemini (limited by AI_ANALYSIS_CAP)
-    for idx, s in enumerate(high_conviction, start=1):
-        lines.append(f"{idx}. {s['ticker']} (Score: {s['score']})")
-        lines.append(f"   Price: {s['price']}")
-        lines.append(f"   Signals: {', '.join(s['reasons'])}")
-
-        if ai_disabled:
-            lines.append("   AI disabled; skipping Gemini analysis.\n")
+                        if ticker in data.columns.levels[0]:
+                            ticker_data = data[ticker]
+                            if not ticker_data.empty and len(ticker_data) > 50:
+                                all_data[ticker] = ticker_data
+                    except (KeyError, AttributeError):
+                        continue
+            
+            time.sleep(CHUNK_DELAY)
+            
+        except Exception as e:
+            print(f"Error downloading chunk: {e}")
             continue
+    
+    print(f"Successfully downloaded data for {len(all_data)} tickers")
+    return all_data
 
-        if ai_count >= AI_ANALYSIS_CAP:
-            lines.append(f"   AI analysis cap reached ({AI_ANALYSIS_CAP}); skipping further AI analysis.\n")
-            ai_disabled = True
-            continue
 
-        # Attempt primary then fallback model with retries; detect fatal model-not-found
-        success = False
-        fatal = False
-        ai_text = ""
-        for model in (AI_PRIMARY_MODEL, AI_FALLBACK_MODEL):
-            for attempt in range(AI_MAX_RETRIES):
-                ok, txt, is_fatal = get_gemini_analysis(s['ticker'], model)
-                if is_fatal:
-                    fatal = True
-                    ai_text = txt
-                    break
-                if ok:
-                    success = True
-                    ai_text = txt
-                    break
-                else:
-                    print(f"   ⚠️ {model} attempt {attempt+1} failed for {s['ticker']}: {txt}")
-                    time.sleep(1 + attempt)
-            if success or fatal:
-                break
-
-        if fatal:
-            ai_disabled = True
-            lines.append("   🛑 Gemini model not available on this runner (model-not-found). AI disabled for rest of run.\n")
-            lines.append(f"   Diagnostic: {ai_text}\n")
-            # don't increment ai_count; it's disabled now
-            continue
-
-        if not success:
-            consecutive_ai_failures += 1
-            lines.append(f"   🧠 Gemini analysis failed for {s['ticker']} (consecutive AI failures: {consecutive_ai_failures}).\n")
-            if consecutive_ai_failures >= AI_MAX_CONSECUTIVE_FAILURES:
-                ai_disabled = True
-                lines.append("   🛑 Reached maximum consecutive AI failures; disabling AI for rest of run.\n")
-            continue
+def calculate_catos_score(df: pd.DataFrame) -> Tuple[float, Dict]:
+    """
+    Calculate the Catos Method score based on TradingView setup.
+    
+    Scoring:
+    - SMA Alignment (40 max):
+      * Price > SMA21 > SMA55 > SMA233: 40 points (strongest)
+      * SMA21 > SMA55 > SMA233: 30 points
+      * SMA55 > SMA233: 15 points
+    - MACD (20 max): Histogram positive & rising
+    - DMI (15 max): +DI > -DI
+    - StochRSI (25 max): Bullish signals
+    
+    Returns: (score, details_dict)
+    """
+    if len(df) < 250:
+        return 0.0, {"error": "Insufficient data"}
+    
+    score = 0.0
+    details = {}
+    
+    try:
+        # Get current values
+        close = df['Close'].iloc[-1]
+        
+        # 1. SMA Alignment (40 points max)
+        sma_21 = df['Close'].rolling(21).mean().iloc[-1]
+        sma_55 = df['Close'].rolling(55).mean().iloc[-1]
+        sma_233 = df['Close'].rolling(233).mean().iloc[-1]
+        
+        details['price'] = close
+        details['sma_21'] = sma_21
+        details['sma_55'] = sma_55
+        details['sma_233'] = sma_233
+        
+        # Check alignment - prioritize price above all SMAs
+        if close > sma_21 > sma_55 > sma_233:
+            score += 40
+            details['sma_setup'] = "Perfect Stack (Price > 21 > 55 > 233)"
+        elif sma_21 > sma_55 > sma_233:
+            score += 30
+            details['sma_setup'] = "Strong Trend (21 > 55 > 233)"
+        elif sma_55 > sma_233:
+            score += 15
+            details['sma_setup'] = "Emerging Trend (55 > 233)"
         else:
-            consecutive_ai_failures = 0
-            ai_used = True
-            ai_count += 1
-            lines.append("   🧠 Gemini Verdict:")
-            for L in ai_text.splitlines():
-                lines.append(f"      {L}")
-            lines.append("")
-            time.sleep(SLEEP_BETWEEN_AI)
+            details['sma_setup'] = "No trend alignment"
+        
+        # 2. MACD (20 points)
+        macd = ta.macd(df['Close'], fast=12, slow=26, signal=9)
+        if macd is not None and len(macd) >= 2:
+            macd_hist = macd['MACDh_12_26_9']
+            current_hist = macd_hist.iloc[-1]
+            prev_hist = macd_hist.iloc[-2]
+            
+            macd_positive = current_hist > 0
+            macd_rising = current_hist > prev_hist
+            
+            if macd_positive and macd_rising:
+                score += 20
+                details['macd_signal'] = "Bullish (Positive & Rising)"
+            else:
+                details['macd_signal'] = f"{'Positive' if macd_positive else 'Negative'}, {'Rising' if macd_rising else 'Falling'}"
+        
+        # 3. DMI (15 points)
+        adx_data = ta.adx(df['High'], df['Low'], df['Close'], length=14)
+        if adx_data is not None:
+            plus_di = adx_data['DMP_14'].iloc[-1]
+            minus_di = adx_data['DMN_14'].iloc[-1]
+            
+            if plus_di > minus_di:
+                score += 15
+                details['dmi_signal'] = f"Bullish (+DI {plus_di:.1f} > -DI {minus_di:.1f})"
+            else:
+                details['dmi_signal'] = f"Bearish (+DI {plus_di:.1f} < -DI {minus_di:.1f})"
+        
+        # 4. StochRSI (25 points) - Settings from your chart: (14, 80, 20, with K=7, D=5)
+        try:
+            stochrsi = ta.stochrsi(df['Close'], length=14, rsi_length=14, k=7, d=5)
+            if stochrsi is not None and len(stochrsi) >= 2:
+                k_line = stochrsi['STOCHRSIk_14_14_7_5']
+                d_line = stochrsi['STOCHRSId_14_14_7_5']
+                
+                current_k = k_line.iloc[-1]
+                prev_k = k_line.iloc[-2]
+                current_d = d_line.iloc[-1]
+                prev_d = d_line.iloc[-2]
+                
+                details['stochrsi_k'] = current_k
+                details['stochrsi_d'] = current_d
+                
+                # Bullish cross: K crosses above D below 80
+                if prev_k <= prev_d and current_k > current_d and current_k < 80:
+                    score += 25
+                    details['stochrsi_signal'] = "Bullish Cross (K crossed above D)"
+                # Rising momentum above 20
+                elif current_k > prev_k and current_d > prev_d and current_k > 20 and current_d > 20:
+                    score += 15
+                    details['stochrsi_signal'] = "Rising Momentum"
+                else:
+                    details['stochrsi_signal'] = f"K={current_k:.1f}, D={current_d:.1f}"
+        except Exception as e:
+            details['stochrsi_signal'] = f"Calculation error: {str(e)[:50]}"
+        
+    except Exception as e:
+        details['error'] = str(e)
+        return 0.0, details
+    
+    return score, details
 
-    if match_count == 0:
-        lines.append("No matches passed the technical threshold today.\n")
 
-    # Diagnostics summary
-    lines.append("\n--- DIAGNOSTICS ---")
-    lines.append(f"Failed downloads / missing tickers: {len(failed_downloads)}")
-    if failed_downloads:
-        lines.append(", ".join(sorted(list(failed_downloads))[:200]) + ("" if len(failed_downloads) <= 200 else f"... (+{len(failed_downloads)-200} more)"))
-    lines.append(f"Tickers that crashed during analysis: {len(failed_analysis)}")
-    if failed_analysis:
-        lines.append(", ".join(sorted(list(failed_analysis))[:200]) + ("" if len(failed_analysis) <= 200 else f"... (+{len(failed_analysis)-200} more)"))
-    lines.append(f"AI used: {'Yes' if ai_used else 'No'}")
-    lines.append(f"AI disabled due to fatal model-not-found or failures: {'Yes' if ai_disabled else 'No'}")
-    lines.append(f"AI analyses performed this run: {ai_count} (cap: {AI_ANALYSIS_CAP})")
+def get_fundamental_data(ticker: str) -> Dict:
+    """
+    Fetch fundamental data for AI analysis.
+    """
+    try:
+        stock = yf.Ticker(ticker)
+        info = stock.info
+        
+        return {
+            'sector': info.get('sector', 'N/A'),
+            'industry': info.get('industry', 'N/A'),
+            'pe_ratio': info.get('trailingPE', 'N/A'),
+            'peg_ratio': info.get('pegRatio', 'N/A'),
+            'profit_margin': info.get('profitMargins', 'N/A'),
+            'operating_margin': info.get('operatingMargins', 'N/A'),
+            'market_cap': info.get('marketCap', 'N/A'),
+            'revenue_growth': info.get('revenueGrowth', 'N/A')
+        }
+    except:
+        return {}
 
-    body = "\n".join(lines)
-    subject = f"🚀 {match_count} High-Conviction Breakouts (>= {TECHNICAL_SCORE_THRESHOLD})" if match_count else f"⚠️ MARKET SCAN: 0 Matches ({datetime.date.today()})"
-    sent = send_email(subject, body)
-    if not sent:
-        print("❌ Final report failed to send; check EMAIL secrets and logs.")
+
+def validate_with_gemini(candidates: List[Dict], api_key: str) -> List[Dict]:
+    """
+    Validate technical winners using Gemini AI.
+    Handles rate limits and model fallback.
+    """
+    print(f"\nValidating {len(candidates)} candidates with Gemini AI...")
+    
+    genai.configure(api_key=api_key)
+    
+    # Try primary model first, fallback to gemini-pro
+    models_to_try = ['gemini-1.5-flash', 'gemini-pro']
+    model = None
+    
+    for model_name in models_to_try:
+        try:
+            model = genai.GenerativeModel(model_name)
+            # Test the model
+            test_response = model.generate_content("test")
+            print(f"Using model: {model_name}")
+            break
+        except Exception as e:
+            print(f"Model {model_name} unavailable: {e}")
+            continue
+    
+    if model is None:
+        print("Warning: No Gemini model available. Returning candidates without AI validation.")
+        return candidates
+    
+    validated = []
+    
+    for candidate in candidates:
+        ticker = candidate['ticker']
+        fundamentals = get_fundamental_data(ticker)
+        
+        if not fundamentals:
+            continue
+        
+        prompt = f"""Analyze this stock for a breakout or trend continuation trade:
+
+Ticker: {ticker}
+Technical Score: {candidate['score']:.1f}%
+SMA Setup: {candidate['details'].get('sma_setup', 'N/A')}
+Sector: {fundamentals.get('sector')}
+Industry: {fundamentals.get('industry')}
+P/E Ratio: {fundamentals.get('pe_ratio')}
+PEG Ratio: {fundamentals.get('peg_ratio')}
+Profit Margin: {fundamentals.get('profit_margin')}
+
+Rate this stock's breakout/continuation potential on a scale of 1-10 and provide 2-3 sentence reasoning focusing on technical momentum and fundamental strength.
+Format: Score: X/10 | Reasoning: [your analysis]"""
+
+        try:
+            response = model.generate_content(prompt)
+            ai_analysis = response.text
+            
+            candidate['ai_analysis'] = ai_analysis
+            candidate['fundamentals'] = fundamentals
+            validated.append(candidate)
+            
+            time.sleep(1)  # Rate limit protection
+            
+        except Exception as e:
+            error_msg = str(e)
+            
+            # Handle rate limits
+            if '429' in error_msg or 'quota' in error_msg.lower():
+                print(f"Rate limit hit. Sleeping 60 seconds...")
+                time.sleep(60)
+                try:
+                    response = model.generate_content(prompt)
+                    candidate['ai_analysis'] = response.text
+                    candidate['fundamentals'] = fundamentals
+                    validated.append(candidate)
+                except:
+                    candidate['ai_analysis'] = "Rate limit exceeded"
+                    candidate['fundamentals'] = fundamentals
+                    validated.append(candidate)
+            else:
+                print(f"Error analyzing {ticker}: {e}")
+                candidate['ai_analysis'] = f"Analysis failed: {error_msg[:100]}"
+                candidate['fundamentals'] = fundamentals
+                validated.append(candidate)
+    
+    return validated
+
+
+def send_email_report(results: List[Dict], email_config: Dict):
+    """
+    Send email report via Gmail SMTP.
+    Always sends an email (even if no results) to confirm the scan ran.
+    """
+    print("\nSending email report...")
+    
+    sender = email_config['sender']
+    password = email_config['password']
+    receiver = email_config['receiver']
+    
+    msg = MIMEMultipart('alternative')
+    msg['Subject'] = f"Catos Scanner Results - {datetime.now().strftime('%Y-%m-%d')}"
+    msg['From'] = sender
+    msg['To'] = receiver
+    
+    # Build HTML report
+    if len(results) == 0:
+        html_body = f"""
+        <html>
+        <body>
+            <h2>Catos Method Daily Scanner Report</h2>
+            <p><strong>Date:</strong> {datetime.now().strftime('%Y-%m-%d %H:%M UTC')}</p>
+            <p><strong>Status:</strong> ✅ Scan completed successfully</p>
+            <p><strong>Results:</strong> No stocks met the criteria today (Score > {MIN_SCORE}%)</p>
+            <p>The scanner is working correctly. Check back tomorrow!</p>
+        </body>
+        </html>
+        """
     else:
-        print("✅ Final report sent or attempted.")
+        stocks_html = ""
+        for r in results:
+            fundamentals = r.get('fundamentals', {})
+            details = r['details']
+            stocks_html += f"""
+            <div style="border: 1px solid #ddd; padding: 15px; margin: 10px 0; border-radius: 5px;">
+                <h3>{r['ticker']} - Score: {r['score']:.1f}%</h3>
+                <p><strong>Price:</strong> ${details.get('price', 'N/A'):.2f}</p>
+                <p><strong>SMA Setup:</strong> {details.get('sma_setup', 'N/A')}</p>
+                <p><strong>MACD:</strong> {details.get('macd_signal', 'N/A')}</p>
+                <p><strong>DMI:</strong> {details.get('dmi_signal', 'N/A')}</p>
+                <p><strong>StochRSI:</strong> {details.get('stochrsi_signal', 'N/A')}</p>
+                <hr>
+                <p><strong>Sector:</strong> {fundamentals.get('sector', 'N/A')}</p>
+                <p><strong>P/E:</strong> {fundamentals.get('pe_ratio', 'N/A')}</p>
+                <p><strong>PEG:</strong> {fundamentals.get('peg_ratio', 'N/A')}</p>
+                <hr>
+                <p><strong>AI Analysis:</strong></p>
+                <p>{r.get('ai_analysis', 'N/A')}</p>
+            </div>
+            """
+        
+        html_body = f"""
+        <html>
+        <body>
+            <h2>Catos Method Daily Scanner Report</h2>
+            <p><strong>Date:</strong> {datetime.now().strftime('%Y-%m-%d %H:%M UTC')}</p>
+            <p><strong>Matches Found:</strong> {len(results)}</p>
+            <hr>
+            {stocks_html}
+        </body>
+        </html>
+        """
+    
+    msg.attach(MIMEText(html_body, 'html'))
+    
+    try:
+        with smtplib.SMTP_SSL('smtp.gmail.com', 465) as smtp:
+            smtp.login(sender, password)
+            smtp.send_message(msg)
+        print("✅ Email sent successfully")
+    except Exception as e:
+        print(f"❌ Email failed: {e}")
+
+
+def main():
+    """
+    Main execution flow.
+    """
+    print("=" * 60)
+    print("CATOS METHOD STOCK SCANNER")
+    print("=" * 60)
+    print(f"Started at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S UTC')}\n")
+    
+    # Load credentials
+    api_key = os.environ.get('GENAI_API_KEY')
+    email_config = {
+        'sender': os.environ.get('EMAIL_SENDER'),
+        'password': os.environ.get('EMAIL_PASSWORD'),
+        'receiver': os.environ.get('EMAIL_RECEIVER')
+    }
+    
+    if not all([api_key, email_config['sender'], email_config['password'], email_config['receiver']]):
+        print("❌ Missing required environment variables")
+        return
+    
+    # Step 1: Get tickers
+    tickers = get_all_tickers()
+    
+    # Step 2: Download data
+    stock_data = download_data_in_chunks(tickers)
+    
+    # Step 3: Calculate scores
+    print("\nCalculating Catos scores...")
+    candidates = []
+    
+    for ticker, df in stock_data.items():
+        try:
+            score, details = calculate_catos_score(df)
+            
+            if score >= MIN_SCORE:
+                print(f"✅ {ticker}: {score:.1f}% - {details.get('sma_setup', '')}")
+                candidates.append({
+                    'ticker': ticker,
+                    'score': score,
+                    'details': details
+                })
+        except Exception as e:
+            print(f"Error analyzing {ticker}: {e}")
+            continue
+    
+    print(f"\nFound {len(candidates)} candidates with score >= {MIN_SCORE}%")
+    
+    # Step 4: AI validation
+    if len(candidates) > 0 and api_key:
+        validated = validate_with_gemini(candidates, api_key)
+    else:
+        validated = candidates
+    
+    # Step 5: Send report (always)
+    send_email_report(validated, email_config)
+    
+    print("\n" + "=" * 60)
+    print(f"Scan completed at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S UTC')}")
+    print("=" * 60)
+
 
 if __name__ == "__main__":
-    run_scanner()
+    main()
