@@ -17,69 +17,126 @@ from typing import List, Dict, Tuple
 import talib
 
 # Configuration
-CHUNK_SIZE = 30
-CHUNK_DELAY = 1.5
-MIN_SCORE = 70
-LOOKBACK_DAYS = 250
+CHUNK_SIZE = 30  # Download 30 tickers at a time
+CHUNK_DELAY = 1.5  # Sleep 1.5 seconds between chunks (anti-ban protection)
+MIN_SCORE = 70  # Minimum score to qualify
+MIN_PRICE = 5.0  # Filter out penny stocks below $5
+LOOKBACK_DAYS = 250  # Need enough data for SMA233
 
 
 def get_all_tickers() -> List[str]:
-    """Get major tickers to scan"""
-    print("Fetching ticker list...")
-    
-    tickers = set()
+    """Get ALL US stocks from GitHub repo (6000+)"""
+    print("Fetching complete US stock list...")
     
     try:
-        # S&P 500
-        sp500 = pd.read_html("https://en.wikipedia.org/wiki/List_of_S%26P_500_companies")[0]
-        tickers.update(sp500['Symbol'].tolist())
+        import requests
+        import io
         
-        # NASDAQ 100
-        nasdaq = pd.read_html("https://en.wikipedia.org/wiki/NASDAQ-100")[4]
-        tickers.update(nasdaq['Ticker'].tolist())
-    except:
-        pass
+        # This repo maintains a clean list of all US stocks (NYSE, NASDAQ, AMEX)
+        url = "https://raw.githubusercontent.com/rreichel3/US-Stock-Symbols/main/all/all_tickers.txt"
+        response = requests.get(url, timeout=30)
+        
+        if response.status_code == 200:
+            # Parse the ticker list
+            tickers_raw = response.text.strip().split('\n')
+            
+            # Clean up tickers
+            cleaned = []
+            for ticker in tickers_raw:
+                ticker = ticker.strip().upper()
+                # Filter out:
+                # - Tickers with special characters (warrants, preferred shares, etc.)
+                # - Empty strings
+                if ticker and not any(char in ticker for char in ['^', '.', '/', '=']):
+                    cleaned.append(ticker)
+            
+            print(f"✅ Loaded {len(cleaned)} tickers from complete US stock list")
+            return sorted(list(set(cleaned)))
+        else:
+            raise Exception(f"Failed to fetch: HTTP {response.status_code}")
     
-    # Add major stocks
-    major = ['AAPL','MSFT','GOOGL','AMZN','NVDA','META','TSLA','AMD','NFLX','INTC']
-    tickers.update(major)
-    
-    cleaned = [t.strip().upper() for t in tickers if t and '^' not in str(t)]
-    print(f"Scanning {len(cleaned)} tickers")
-    return sorted(list(cleaned))
+    except Exception as e:
+        print(f"⚠️ Failed to fetch full ticker list: {e}")
+        print("Falling back to major indices...")
+        
+        # Fallback to S&P 500 + NASDAQ 100
+        tickers = set()
+        try:
+            sp500 = pd.read_html("https://en.wikipedia.org/wiki/List_of_S%26P_500_companies")[0]
+            tickers.update(sp500['Symbol'].tolist())
+            nasdaq = pd.read_html("https://en.wikipedia.org/wiki/NASDAQ-100")[4]
+            tickers.update(nasdaq['Ticker'].tolist())
+        except:
+            pass
+        
+        major = ['AAPL','MSFT','GOOGL','AMZN','NVDA','META','TSLA','AMD','NFLX','INTC']
+        tickers.update(major)
+        
+        cleaned = [t.strip().upper() for t in tickers if t and '^' not in str(t)]
+        print(f"Fallback: {len(cleaned)} tickers")
+        return sorted(list(cleaned))
 
 
 def download_data_in_chunks(tickers: List[str]) -> Dict:
-    """Download in chunks to avoid bans"""
-    print(f"\nDownloading data...")
+    """Download in chunks to avoid Yahoo Finance IP bans"""
+    print(f"\nDownloading data in chunks of {CHUNK_SIZE}...")
+    print(f"Total chunks: {(len(tickers) + CHUNK_SIZE - 1) // CHUNK_SIZE}")
+    print(f"Estimated time: ~{((len(tickers) / CHUNK_SIZE) * CHUNK_DELAY) / 60:.1f} minutes\n")
+    
     all_data = {}
+    failed_count = 0
     
     for i in range(0, len(tickers), CHUNK_SIZE):
         chunk = tickers[i:i + CHUNK_SIZE]
-        print(f"Chunk {i//CHUNK_SIZE + 1}/{(len(tickers)-1)//CHUNK_SIZE + 1}")
+        chunk_num = i // CHUNK_SIZE + 1
+        total_chunks = (len(tickers) + CHUNK_SIZE - 1) // CHUNK_SIZE
+        
+        print(f"Chunk {chunk_num}/{total_chunks} ({len(chunk)} tickers)...", end=" ")
         
         try:
-            data = yf.download(chunk, period='1y', group_by='ticker', progress=False, threads=True)
+            data = yf.download(
+                chunk, 
+                period='1y', 
+                group_by='ticker', 
+                progress=False, 
+                threads=True,
+                ignore_tz=True
+            )
             
             if len(chunk) == 1:
-                if not data.empty:
-                    all_data[chunk[0]] = data
+                ticker = chunk[0]
+                if not data.empty and len(data) >= 250:
+                    all_data[ticker] = data
+                    print(f"✓ {ticker}")
+                else:
+                    failed_count += 1
+                    print(f"✗ {ticker} (insufficient data)")
             else:
+                success = 0
                 for ticker in chunk:
                     try:
                         if ticker in data.columns.levels[0]:
                             ticker_data = data[ticker]
-                            if not ticker_data.empty and len(ticker_data) > 50:
+                            if not ticker_data.empty and len(ticker_data) >= 250:
                                 all_data[ticker] = ticker_data
+                                success += 1
+                            else:
+                                failed_count += 1
                     except:
+                        failed_count += 1
                         continue
+                print(f"✓ {success}/{len(chunk)} succeeded")
             
+            # Anti-ban delay
             time.sleep(CHUNK_DELAY)
+        
         except Exception as e:
-            print(f"Chunk error: {e}")
+            print(f"✗ Error: {str(e)[:50]}")
+            failed_count += len(chunk)
+            time.sleep(CHUNK_DELAY * 2)  # Longer delay after error
             continue
     
-    print(f"Downloaded {len(all_data)} stocks")
+    print(f"\n✅ Downloaded {len(all_data)} stocks (filtered out {failed_count} with insufficient data)")
     return all_data
 
 
@@ -87,14 +144,17 @@ def calculate_catos_score(df: pd.DataFrame) -> Tuple[float, Dict]:
     """
     Catos Method scoring using talib
     
+    Returns (0, error_dict) if insufficient data or penny stock
+    
     Scoring:
     - SMA Alignment (40 max): Price > 21 > 55 > 233 = 40pts, 21 > 55 > 233 = 30pts, 55 > 233 = 15pts
     - MACD (20 max): Histogram positive & rising
     - DMI (15 max): +DI > -DI
     - StochRSI (25 max): Bullish signals
     """
+    # Need at least 250 bars for SMA233 calculation
     if len(df) < 250:
-        return 0.0, {"error": "Insufficient data"}
+        return 0.0, {"error": "Insufficient data (<250 bars)"}
     
     score = 0.0
     details = {}
@@ -106,10 +166,22 @@ def calculate_catos_score(df: pd.DataFrame) -> Tuple[float, Dict]:
         
         current_price = close[-1]
         
+        # Filter out penny stocks (< $5)
+        if current_price < 5.0:
+            return 0.0, {"error": f"Penny stock (${current_price:.2f})"}
+        
+        # Check for sufficient data quality (no excessive NaN values)
+        if np.isnan(close).sum() > len(close) * 0.1:  # More than 10% NaN
+            return 0.0, {"error": "Too many missing data points"}
+        
         # 1. SMAs (40 points)
         sma21 = talib.SMA(close, timeperiod=21)[-1]
         sma55 = talib.SMA(close, timeperiod=55)[-1]
         sma233 = talib.SMA(close, timeperiod=233)[-1]
+        
+        # Verify SMAs calculated properly
+        if np.isnan(sma21) or np.isnan(sma55) or np.isnan(sma233):
+            return 0.0, {"error": "SMA calculation failed (insufficient clean data)"}
         
         details['price'] = current_price
         details['sma_21'] = sma21
@@ -314,9 +386,11 @@ def send_email_report(results: List[Dict], email_config: Dict):
 
 def main():
     print("=" * 60)
-    print("CATOS METHOD SCANNER")
+    print("MORNING SCANNER - ALL US STOCKS")
     print("=" * 60)
-    print(f"Started: {datetime.now().strftime('%Y-%m-%d %H:%M:%S UTC')}\n")
+    print(f"Started: {datetime.now().strftime('%Y-%m-%d %H:%M:%S UTC')}")
+    print(f"Filters: Price >= ${MIN_PRICE}, Score >= {MIN_SCORE}%")
+    print("=" * 60 + "\n")
     
     # Load credentials
     api_key = os.environ.get('GENAI_API_KEY')
