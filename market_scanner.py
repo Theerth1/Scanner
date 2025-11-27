@@ -19,7 +19,7 @@ import talib
 # Configuration
 CHUNK_SIZE = 30
 CHUNK_DELAY = 1.5
-MIN_SCORE = 80
+MIN_SCORE = 70
 LOOKBACK_DAYS = 250
 
 
