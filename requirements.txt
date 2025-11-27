@@ -1,6 +1,6 @@
 yfinance
 pandas
-git+https://github.com/twopirllc/pandas-ta.git@development
+https://github.com/twopirllc/pandas-ta/archive/development.zip
 google-generativeai>=0.8.3
 requests
 numpy<2.0.0
