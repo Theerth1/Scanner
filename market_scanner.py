@@ -144,6 +144,17 @@ def calculate_catos_score(df: pd.DataFrame) -> Tuple[float, Dict]:
             score += 10 # Bonus points pushing over 100
             details['breakout'] = "🚨 NEW 20-DAY HIGH"
 
+        vol_sma = talib.SMA(volume, timeperiod=20)[-1]
+        if volume[-1] > 1.2 * vol_sma:  # 20% above average
+            score += 10
+            details['vol'] = "High Volume (Confirmed)"
+        elif volume[-1] > vol_sma:
+            score += 5
+            details['vol'] = "Slight Volume Increase"
+        else:
+            details['vol'] = "Low Volume (Caution)"
+
+
         return score, details
 
     except Exception as e:
