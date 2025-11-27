@@ -18,7 +18,7 @@ import io
 import requests
 import yfinance as yf
 import pandas as pd
-import pandas_ta as ta
+import pandas_ta_classic as ta
 import google.generativeai as genai
 import smtplib
 from email.mime.text import MIMEText
@@ -230,55 +230,34 @@ def analyze_ticker(ticker: str, df: pd.DataFrame):
         return 0, [f"Analyzer crash: {e}"]
 
 # ---------------- Gemini analysis (defensive) ----------------
-def get_gemini_analysis(ticker: str, model_name: str):
-    """
-    Returns (success:bool, text:str, fatal_model_not_found:bool)
-    If a 'model-not-found' 404 occurs, fatal_model_not_found=True.
-    """
-    if not GENAI_API_KEY:
-        return False, "Gemini API key missing; skipping AI analysis.", False
+def get_gemini_analysis(ticker):
+    global AI_DISABLED
+    if AI_DISABLED: return "AI Analysis Skipped (Too many errors)"
 
     try:
-        stock = yf.Ticker(ticker)
-        info = stock.info or {}
-        def g(k): return info.get(k, 'N/A')
-        fund_data = {
-            "Symbol": ticker,
-            "Sector": g('sector'),
-            "Forward PE": g('forwardPE'),
-            "PEG Ratio": g('pegRatio'),
-            "Profit Margins": g('profitMargins'),
-            "Revenue Growth": g('revenueGrowth'),
-            "Target Price": g('targetMeanPrice'),
-            "Current Price": g('currentPrice')
-        }
-
-        prompt = f"""
-Act as a strict hedge fund manager.
-I have a strong TECHNICAL BUY signal for {ticker} based on Fibonacci trends.
-
-Here is the fundamental data:
-{fund_data}
-
-Please analyze this stock in under 50 words.
-1. Is the valuation dangerous? (e.g. PEG > 3 or negative earnings)
-2. Is this a real company or a junk stock?
-3. Final Verdict: "CONVICTION BUY", "SPECULATIVE BUY", or "TRAP/AVOID".
-"""
-
-        model = genai.GenerativeModel(model_name)
-        response = model.generate_content(prompt)
-        text = response.text.strip() if hasattr(response, "text") else str(response).strip()
-        return True, text, False
+        # Try primary model (1.5 Flash)
+        model = genai.GenerativeModel('gemini-1.5-flash')
+        prompt = f"Analyze {ticker} for a breakout or continuation trade. Verdict: BUY or AVOID? Keep it under 50 words."
+        
+        try:
+            response = model.generate_content(prompt)
+            return response.text.strip()
+        except Exception as e:
+            # CATCH THE 404 ERROR
+            if "404" in str(e) or "not found" in str(e):
+                print("⚠️ 1.5 Flash not found, using fallback model...")
+                try:
+                    # Fallback to the older Pro model if Flash fails
+                    model = genai.GenerativeModel('gemini-pro')
+                    response = model.generate_content(prompt)
+                    return response.text.strip()
+                except:
+                    return "AI Fallback Failed"
+            raise e
 
     except Exception as e:
-        err_text = str(e)
-        print(f"⚠️ Gemini error for model {model_name}: {err_text}")
-        # Detect the fatal model-not-found pattern
-        if "404" in err_text and "models/" in err_text and "is not found" in err_text:
-            return False, f"Fatal model-not-found for {model_name}: {err_text}", True
-        return False, f"AI error for {model_name}: {err_text}", False
-
+        print(f"⚠️ AI Error on {ticker}: {e}")
+        return "AI Unavailable"
 # ---------------- Main run ----------------
 def run_scanner():
     started_at = datetime.datetime.utcnow().isoformat() + "Z"
