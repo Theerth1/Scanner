@@ -1,5 +1,5 @@
 yfinance
 pandas
-pandas-ta
+git+https://github.com/twopirllc/pandas-ta.git@master#egg=pandas_ta
 google-generativeai>=0.8.3
 requests
