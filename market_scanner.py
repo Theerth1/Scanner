@@ -18,7 +18,7 @@ import talib
 # Configuration
 CHUNK_SIZE = 30  
 CHUNK_DELAY = 1.5
-MIN_SCORE = 100
+MIN_SCORE = 110
 MIN_PRICE = 5.0
 
 # --- UTILITIES ---
@@ -132,6 +132,17 @@ def calculate_catos_score(df: pd.DataFrame) -> Tuple[float, Dict]:
                 else: score += 15
             else: score += 5
 
+        vol_sma = talib.SMA(volume, timeperiod=20)[-1]
+        if volume[-1] > 1.2 * vol_sma:  # 20% above average
+            score += 10
+            details['vol'] = "High Volume (Confirmed)"
+        elif volume[-1] > vol_sma:
+            score += 5
+            details['vol'] = "Slight Volume Increase"
+        else:
+            details['vol'] = "Low Volume (Caution)"
+
+
         # 5. BREAKOUT
         high_20 = np.max(high[-21:-1]) 
         if close[-1] > high_20:
@@ -184,7 +195,7 @@ def validate_with_gemini(candidates: List[Dict], api_key: str) -> List[Dict]:
 
         # 2. Run AI
         if active_model:
-            prompt = f"Analyze {ticker}. Technical score {c['score']}/100. Trend: {c['details']['trend']}. Give a 1-sentence verdict on fundamentals."
+            prompt = f"Analyze {ticker}. Technical score {c['score']}/120. Trend: {c['details']['trend']}. Give a 1-sentence verdict if these stocks are bullish (breakout after consolidation/continuation trading) using fundamental analysis."
             try:
                 response = active_model.generate_content(prompt)
                 c['ai_analysis'] = response.text.strip()
