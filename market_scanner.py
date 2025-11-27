@@ -18,7 +18,7 @@ import talib
 # Configuration
 CHUNK_SIZE = 30  
 CHUNK_DELAY = 1.5
-MIN_SCORE = 80
+MIN_SCORE = 100
 MIN_PRICE = 5.0
 
 # --- UTILITIES ---
