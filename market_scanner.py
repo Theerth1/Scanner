@@ -125,12 +125,17 @@ def calculate_catos_score(df: pd.DataFrame) -> Tuple[float, Dict]:
         d = fastd[-1]
         
         if k > d:
-            if k > 50: 
-                score += 20
-                details['stoch'] = "Power Zone (K > D & > 50)"
+            if adx > 30:  # trend is strong
+                if k > 50:  # strong stochastic
+                    score += 20
+                    details['stoch'] = "Power Zone (K > D & K > 50 & Strong Trend)"
+                else:
+                    score += 15
+                    details['stoch'] = "Momentum Rising (Strong Trend)"
             else:
-                score += 10
-                details['stoch'] = "Momentum Rising"
+                score += 5
+                details['stoch'] = "Momentum Rising (Weak Trend)"
+
 
         # 5. BREAKOUT BONUS (+10 pts)
         # Logic: Breaking 20 day high
