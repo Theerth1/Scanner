@@ -36,6 +36,7 @@ jobs:
           pip install --upgrade google-generativeai
 
 
+
       - name: Verify pandas-ta import (debug)
         run: |
           python - <<'PY'
