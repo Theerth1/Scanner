@@ -161,53 +161,81 @@ def calculate_catos_score(df: pd.DataFrame) -> Tuple[float, Dict]:
         return 0.0, {'error': str(e)}
 
 # --- AI VALIDATION ---
+# --- AI VALIDATION (FIXED) ---
 def validate_with_gemini(candidates: List[Dict], api_key: str) -> List[Dict]:
     print(f"\nValidating {len(candidates)} candidates with AI...")
+    
+    if not api_key:
+        print("❌ No API Key found. Skipping AI validation.")
+        return candidates
+
     try:
         genai.configure(api_key=api_key)
-        # Fallback list of models to try
-        models = ['gemini-1.5-flash', 'gemini-pro', 'gemini-1.0-pro']
         
-        active_model = None
-        for m in models:
-            try:
-                model = genai.GenerativeModel(m)
-                model.generate_content("test")
-                active_model = model
-                print(f"✅ Using AI Model: {m}")
+        # 1. Dynamically find a working model that supports content generation
+        # This prevents 404s by only selecting models your key is actually allowed to use.
+        available_models = []
+        for m in genai.list_models():
+            if 'generateContent' in m.supported_generation_methods:
+                available_models.append(m.name)
+        
+        # Prioritize Flash (Fast/Cheap) -> Pro -> Others
+        active_model_name = None
+        priority_order = ['models/gemini-1.5-flash', 'models/gemini-1.5-pro', 'models/gemini-1.0-pro']
+        
+        # Check priority list against what we actually found
+        for priority in priority_order:
+            if priority in available_models:
+                active_model_name = priority
                 break
-            except: continue
+        
+        # Fallback to first available if strict priority fails
+        if not active_model_name and available_models:
+            active_model_name = available_models[0]
             
-        if not active_model:
-            print("⚠️ AI Unavailable (Check Key/Billing). Returning technicals only.")
+        if not active_model_name:
+            print("⚠️ API Connected, but no text generation models found. Check API Key permissions.")
             return candidates
+
+        print(f"✅ Using AI Model: {active_model_name}")
+        model = genai.GenerativeModel(active_model_name)
 
         validated = []
         for c in candidates:
             ticker = c['ticker']
+            # Simplified prompt to save tokens
             prompt = f"""
-            Analyze {ticker} for a MOMENTUM BREAKOUT trade.
-            Tech Score: {c['score']}%
-            Trend: {c['details'].get('trend')}
-            Signal: {c['details'].get('breakout', 'Consolidating')}
+            Role: Hedge Fund Analyst.
+            Task: Evaluate {ticker} for a breakout trade.
+            Data: 
+            - Technical Score: {c['score']}/100
+            - Trend: {c['details'].get('trend')}
+            - Signal: {c['details'].get('breakout', 'Consolidation')}
             
-            Briefly assess:
-            1. Sector Strength
-            2. Recent Catalyst/News
-            3. Verdict: "BUY" or "WAIT"
+            Output strictly in this format:
+            VERDICT: [BUY or WAIT]
+            REASON: [1 sentence summary]
             """
             try:
-                response = active_model.generate_content(prompt)
-                c['ai_analysis'] = response.text
-                time.sleep(2) # Rate limit protection
-            except:
-                c['ai_analysis'] = "AI Rate Limit/Error"
+                # Add a small timeout to prevent hanging
+                response = model.generate_content(prompt, request_options={'timeout': 10})
+                c['ai_analysis'] = response.text.strip()
+                time.sleep(1.5) # Respect rate limits (15 RPM for free tier)
+            except Exception as e:
+                error_msg = str(e)
+                if "429" in error_msg:
+                    c['ai_analysis'] = "Rate Limited (Wait)"
+                    time.sleep(5) # Back off longer if hit limit
+                else:
+                    c['ai_analysis'] = f"Error: {error_msg[:20]}..."
+                    print(f"⚠️ Error on {ticker}: {error_msg}")
+            
             validated.append(c)
             
         return validated
 
     except Exception as e:
-        print(f"AI System Error: {e}")
+        print(f"❌ AI System Fatal Error: {e}")
         return candidates
 
 # --- REPORTING ---
