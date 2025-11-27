@@ -2,22 +2,12 @@
 """
 market_scanner.py
 
-Updated: raises technical threshold to 70, adds Gemini fallback model (gemini-pro),
-and implements an AI fail-safe: after 5 consecutive AI failures, stop calling the AI
-and send the technical-only report.
-
-Reads secrets from environment:
-  - GENAI_API_KEY
-  - EMAIL_SENDER
-  - EMAIL_PASSWORD
-  - EMAIL_RECEIVER
-
-Assumes requirements.txt includes:
-  yfinance
-  pandas
-  pandas_ta
-  google-generativeai>=0.8.3
-  requests
+Features:
+- SMA-only stacking logic (SMA21 > SMA55 > SMA233 or SMA55 > SMA233)
+- Robust yfinance chunking + retries + per-ticker fallback
+- Defensive Gemini usage: detects model-not-found 404 and disables AI globally
+- Limits number of Gemini analyses per run (AI_ANALYSIS_CAP)
+- Sends a final email report (always)
 """
 
 import os
@@ -34,32 +24,37 @@ import smtplib
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 
-# ---------------- CONFIG ----------------
+# ---------------- CONFIG (env / tuning) ----------------
 GENAI_API_KEY = os.environ.get("GENAI_API_KEY")
 EMAIL_SENDER = os.environ.get("EMAIL_SENDER")
 EMAIL_PASSWORD = os.environ.get("EMAIL_PASSWORD")
 EMAIL_RECEIVER = os.environ.get("EMAIL_RECEIVER")
 
-# Scanner tuning
-CHUNK_SIZE = 30
-SLEEP_BETWEEN_CHUNKS = 1.5
-SLEEP_BETWEEN_AI = 5
-TECHNICAL_SCORE_THRESHOLD = 70  # <-- raised from 10 to 70
-MIN_DATA_ROWS = 250
+CHUNK_SIZE = int(os.environ.get("CHUNK_SIZE", 30))
+SLEEP_BETWEEN_CHUNKS = float(os.environ.get("SLEEP_BETWEEN_CHUNKS", 1.5))
+SLEEP_BETWEEN_AI = float(os.environ.get("SLEEP_BETWEEN_AI", 5))
+MIN_DATA_ROWS = int(os.environ.get("MIN_DATA_ROWS", 250))
 
-# AI behavior
-AI_PRIMARY_MODEL = "gemini-1.5-flash"
-AI_FALLBACK_MODEL = "gemini-pro"
-AI_MAX_RETRIES = 3
-AI_MAX_CONSECUTIVE_FAILURES = 5  # stop calling AI after this many consecutive failures
+# Technical threshold (only SMAs + MACD/DMI scoring). Example set to 70 previously.
+TECHNICAL_SCORE_THRESHOLD = int(os.environ.get("TECHNICAL_SCORE_THRESHOLD", 70))
 
-# ---------------- Setup ----------------
+# AI configuration
+AI_PRIMARY_MODEL = os.environ.get("AI_PRIMARY_MODEL", "gemini-1.5-flash")
+AI_FALLBACK_MODEL = os.environ.get("AI_FALLBACK_MODEL", "gemini-pro")
+AI_MAX_RETRIES = int(os.environ.get("AI_MAX_RETRIES", 3))
+AI_MAX_CONSECUTIVE_FAILURES = int(os.environ.get("AI_MAX_CONSECUTIVE_FAILURES", 5))
+
+# IMPORTANT: cap how many matches will be sent to Gemini in one run to avoid long runtimes / rate limits
+AI_ANALYSIS_CAP = int(os.environ.get("AI_ANALYSIS_CAP", 25))  # change to suit your quota
+
+# ---------------- Initialize Gemini client if key present ----------------
 if GENAI_API_KEY:
     try:
         genai.configure(api_key=GENAI_API_KEY)
     except Exception as e:
         print(f"⚠️ Warning configuring Gemini client: {e}")
 
+# ---------------- Email helper ----------------
 def send_email(subject: str, body: str) -> bool:
     msg = MIMEMultipart()
     msg['From'] = EMAIL_SENDER or "unknown"
@@ -82,25 +77,22 @@ def send_email(subject: str, body: str) -> bool:
         print(f"❌ Email failed: {e}")
         return False
 
-# ---------------- Utilities ----------------
+# ---------------- Tickers list ----------------
 def get_all_tickers():
+    print("🌍 Fetching full market ticker list...")
     try:
-        print("🌍 Fetching full ticker list...")
         url = "https://raw.githubusercontent.com/rreichel3/US-Stock-Symbols/main/all/all_tickers.txt"
         s = requests.get(url, timeout=30).content
         tickers = pd.read_csv(io.StringIO(s.decode('utf-8')), header=None)[0].tolist()
         clean = [t for t in tickers if isinstance(t, str) and "^" not in t and "." not in t]
-        print(f"✅ {len(clean)} tickers found.")
+        print(f"✅ Found {len(clean)} tickers.")
         return clean
     except Exception as e:
-        print(f"⚠️ Couldn't fetch tickers list: {e}. Using fallback sample.")
-        return ['AAPL', 'NVDA', 'AMD', 'TSLA', 'MSFT']
+        print(f"⚠️ Failed to fetch tickers: {e}. Using fallback.")
+        return ['AAPL','NVDA','AMD','TSLA','MSFT']
 
+# ---------------- Bulk downloader ----------------
 def get_data_bulk(tickers, period="2y", max_retries=3):
-    """
-    Download bulk data with retries. If chunk downloads always fail, fallback to per-ticker downloads.
-    Returns (dataframe, failed_list)
-    """
     failed = []
     attempt = 0
     while attempt < max_retries:
@@ -114,8 +106,9 @@ def get_data_bulk(tickers, period="2y", max_retries=3):
             print(f"   ⚠️ Chunk download attempt {attempt+1} failed: {e}")
             attempt += 1
             time.sleep(1 + attempt)
-    # fallback to individual downloads
-    print("   ↳ Chunk downloads failed after retries; falling back to single-ticker downloads.")
+
+    # fallback to single-ticker downloads
+    print("   ↳ Chunk retries exhausted; falling back to single-ticker downloads.")
     frames = []
     for t in tickers:
         try:
@@ -125,57 +118,53 @@ def get_data_bulk(tickers, period="2y", max_retries=3):
                 continue
             frames.append((t, single))
             time.sleep(1.0)
-        except Exception:
+        except Exception as e:
+            print(f"   ⚠️ Single download failed for {t}: {e}")
             failed.append(t)
     if not frames:
         return pd.DataFrame(), failed
     assembled = pd.concat([df for (_t, df) in frames], axis=1, keys=[_t for _t, df in frames])
     return assembled, failed
 
+# ---------------- Extract per-ticker DataFrame ----------------
 def extract_stock_df_from_bulk(data: pd.DataFrame, ticker: str):
-    """
-    Robustly extract a per-ticker DataFrame from bulk yfinance download, handling MultiIndex shapes.
-    """
     if data is None or data.empty:
         raise KeyError("No data")
     if isinstance(data.columns, pd.MultiIndex):
-        # Try ticker in level 0
+        # Try common placements
         if ticker in data.columns.levels[0]:
             return data.xs(ticker, axis=1, level=0, drop_level=True)
-        # Try ticker in level 1
         if ticker in data.columns.levels[1]:
             return data.xs(ticker, axis=1, level=1, drop_level=True)
-        # Last resort: search levels for str equality
+        # search levels
         for lvl in range(len(data.columns.levels)):
             if any(str(x) == ticker for x in data.columns.levels[lvl]):
                 return data.xs(ticker, axis=1, level=lvl, drop_level=True)
         raise KeyError(f"{ticker} not found in MultiIndex columns")
     else:
-        # single-ticker download
         return data
 
-# ---------------- Strategy / Indicators ----------------
+# ---------------- Strategy: analyze_ticker ----------------
 def analyze_ticker(ticker: str, df: pd.DataFrame):
     """
-    Returns (score:int, reasons:list). Defensive: returns 0 + reason if any issue.
+    SMA-only ordering (no price check):
+      - If SMA21 > SMA55 > SMA233 -> +30 (Perfect stack)
+      - Elif SMA55 > SMA233 -> +10
+    Plus MACD (+20) and DMI (+20).
     """
     try:
         df = df.copy()
-        # flatten multiindex columns if present
         if isinstance(df.columns, pd.MultiIndex):
             df.columns = [c[0] if isinstance(c, tuple) else c for c in df.columns]
-        df = df.dropna()
+
+        # conservative approach: do not drop all NaNs (drop rows where close is NaN)
+        df = df[df['Close'].notna()] if 'Close' in df.columns else df.dropna()
         if len(df) < MIN_DATA_ROWS:
             return 0, [f"Insufficient data (<{MIN_DATA_ROWS})"]
 
-        # ensure required columns
-        for col in ['Close', 'High', 'Low', 'Volume']:
+        for col in ['Close','High','Low','Volume']:
             if col not in df.columns:
                 return 0, [f"Missing column {col}"]
-
-        last_price = float(df['Close'].iloc[-1])
-        if last_price < 1.00:
-            return 0, ["Penny stock (<$1)"]
 
         close = df['Close']
         high = df['High']
@@ -185,27 +174,38 @@ def analyze_ticker(ticker: str, df: pd.DataFrame):
         sma_21 = ta.sma(close, length=21)
         sma_55 = ta.sma(close, length=55)
         sma_233 = ta.sma(close, length=233)
+
         macd = ta.macd(close)
         hist = macd.get('MACDh_12_26_9') if isinstance(macd, dict) else macd['MACDh_12_26_9']
+
         dmi = ta.adx(high, low, close, length=14)
         pos_di = dmi['DMP_14']
         neg_di = dmi['DMN_14']
 
+        # Extract current SMA values safely
+        s21 = sma_21.iloc[-1] if len(sma_21) > 0 else float('nan')
+        s55 = sma_55.iloc[-1] if len(sma_55) > 0 else float('nan')
+        s233 = sma_233.iloc[-1] if len(sma_233) > 0 else float('nan')
+
         score = 0
         reasons = []
 
-        # Perfect fib trend grants 30 points
-        try:
-            if last_price > sma_21.iloc[-1] > sma_55.iloc[-1] > sma_233.iloc[-1]:
+        # SMA-only checks (price is NOT considered)
+        if pd.notna(s21) and pd.notna(s55) and pd.notna(s233):
+            if s21 > s55 > s233:
                 score += 30
-                reasons.append("Perfect Fib Trend")
-            elif last_price > sma_233.iloc[-1]:
+                reasons.append("Perfect SMA Stack (21 > 55 > 233)")
+            elif s55 > s233:
                 score += 10
-                reasons.append("Above 233 SMA")
-        except Exception:
-            reasons.append("SMA calc issue")
+                reasons.append("55 Above 233")
+        else:
+            missing = []
+            if not pd.notna(s21): missing.append("SMA21")
+            if not pd.notna(s55): missing.append("SMA55")
+            if not pd.notna(s233): missing.append("SMA233")
+            reasons.append(f"Missing SMAs: {', '.join(missing)}")
 
-        # MACD rising grants 20
+        # MACD
         try:
             if hist is not None and len(hist) >= 2:
                 if hist.iloc[-1] > 0 and hist.iloc[-1] > hist.iloc[-2]:
@@ -214,7 +214,7 @@ def analyze_ticker(ticker: str, df: pd.DataFrame):
         except Exception:
             reasons.append("MACD calc issue")
 
-        # Positive DMI grants 20
+        # DMI
         try:
             if pos_di.iloc[-1] > neg_di.iloc[-1]:
                 score += 20
@@ -222,21 +222,21 @@ def analyze_ticker(ticker: str, df: pd.DataFrame):
         except Exception:
             reasons.append("DMI calc issue")
 
-        print(f"🔍 {ticker} Score: {score} | Price: {last_price:.2f} | Reasons: {reasons}")
+        print(f"🔍 {ticker} Score: {score} | Reasons: {reasons}")
         return score, reasons
+
     except Exception as e:
         print(f"❌ Analyzer crash for {ticker}: {e}\n{traceback.format_exc()}")
         return 0, [f"Analyzer crash: {e}"]
 
-# ---------------- Gemini / AI ----------------
-def get_gemini_analysis(ticker, active_model=AI_PRIMARY_MODEL):
+# ---------------- Gemini analysis (defensive) ----------------
+def get_gemini_analysis(ticker: str, model_name: str):
     """
-    Attempts to obtain a short Gemini analysis for the ticker.
-    Will try 'active_model' (string). Caller should implement retries and fallback logic.
-    Returns (success:bool, text:str)
+    Returns (success:bool, text:str, fatal_model_not_found:bool)
+    If a 'model-not-found' 404 occurs, fatal_model_not_found=True.
     """
     if not GENAI_API_KEY:
-        return False, "Gemini API key missing; skipping AI analysis."
+        return False, "Gemini API key missing; skipping AI analysis.", False
 
     try:
         stock = yf.Ticker(ticker)
@@ -266,36 +266,37 @@ Please analyze this stock in under 50 words.
 3. Final Verdict: "CONVICTION BUY", "SPECULATIVE BUY", or "TRAP/AVOID".
 """
 
-        model = genai.GenerativeModel(active_model)
+        model = genai.GenerativeModel(model_name)
         response = model.generate_content(prompt)
         text = response.text.strip() if hasattr(response, "text") else str(response).strip()
-        return True, text
-    except Exception as e:
-        return False, f"AI error with model {active_model}: {e}"
+        return True, text, False
 
-# ---------------- Main ----------------
+    except Exception as e:
+        err_text = str(e)
+        print(f"⚠️ Gemini error for model {model_name}: {err_text}")
+        # Detect the fatal model-not-found pattern
+        if "404" in err_text and "models/" in err_text and "is not found" in err_text:
+            return False, f"Fatal model-not-found for {model_name}: {err_text}", True
+        return False, f"AI error for {model_name}: {err_text}", False
+
+# ---------------- Main run ----------------
 def run_scanner():
     started_at = datetime.datetime.utcnow().isoformat() + "Z"
     print(f"🚀 Market scan starting at {started_at}")
 
-    tickers = get_all_tickers()
-    total = len(tickers)
+    all_tickers = get_all_tickers()
+    total = len(all_tickers)
     high_conviction = []
     failed_downloads = set()
     failed_analysis = set()
 
-    # AI state
-    consecutive_ai_failures = 0
-    ai_disabled = False
-
-    print(f"📊 Scanning {total} tickers in chunks of {CHUNK_SIZE} (threshold={TECHNICAL_SCORE_THRESHOLD})")
     for i in range(0, total, CHUNK_SIZE):
-        chunk = tickers[i:i+CHUNK_SIZE]
+        chunk = all_tickers[i:i+CHUNK_SIZE]
         print(f"\n--- chunk {i//CHUNK_SIZE + 1} / {((total-1)//CHUNK_SIZE)+1} (size {len(chunk)}) ---")
         data, failed = get_data_bulk(chunk)
         failed_downloads.update(failed)
         if data is None or (isinstance(data, pd.DataFrame) and data.empty):
-            print("   ⚠️ Empty chunk; marking chunk tickers as failed and continuing.")
+            print("   ⚠️ Chunk returned no data; marking them as failed.")
             failed_downloads.update(chunk)
             time.sleep(SLEEP_BETWEEN_CHUNKS)
             continue
@@ -306,7 +307,7 @@ def run_scanner():
                     stock_df = extract_stock_df_from_bulk(data, ticker)
                 except KeyError as e:
                     failed_downloads.add(ticker)
-                    print(f"   ⚠️ {ticker} missing in data: {e}")
+                    print(f"   ⚠️ {ticker} missing in bulk data: {e}")
                     continue
 
                 score, reasons = analyze_ticker(ticker, stock_df)
@@ -324,99 +325,113 @@ def run_scanner():
                     })
             except Exception as e:
                 failed_analysis.add(ticker)
-                print(f"   ❌ Error while processing {ticker}: {e}\n{traceback.format_exc()}")
+                print(f"   ❌ Processing error for {ticker}: {e}\n{traceback.format_exc()}")
                 continue
 
         time.sleep(SLEEP_BETWEEN_CHUNKS)
 
     match_count = len(high_conviction)
-    print(f"\n🎯 Scan complete. {match_count} stocks met the threshold >= {TECHNICAL_SCORE_THRESHOLD}.")
+    print(f"\n🎯 Scan complete. {match_count} tickers met threshold >= {TECHNICAL_SCORE_THRESHOLD}.")
 
-    # Sort by score desc
     high_conviction.sort(key=lambda x: x['score'], reverse=True)
 
     # Build email body
-    body = []
-    body.append(f"HIGH CONVICTION REPORT: {datetime.date.today()}")
-    body.append(f"Started: {started_at} (UTC)")
-    body.append(f"Scanned {total} tickers in chunks of {CHUNK_SIZE}")
-    body.append(f"Threshold: {TECHNICAL_SCORE_THRESHOLD}")
-    body.append(f"Matches found: {match_count}")
-    body.append("\n========================================\n")
+    lines = []
+    lines.append(f"HIGH CONVICTION REPORT: {datetime.date.today()}")
+    lines.append(f"Started: {started_at} (UTC)")
+    lines.append(f"Scanned {total} tickers in chunks of {CHUNK_SIZE}")
+    lines.append(f"Threshold: {TECHNICAL_SCORE_THRESHOLD}")
+    lines.append(f"Matches found: {match_count}")
+    lines.append("\n========================================\n")
 
-    # If there are matches and AI is enabled, attempt Gemini analysis with fallback
+    # AI variables
+    ai_disabled = False
+    consecutive_ai_failures = 0
     ai_used = False
-    if match_count > 0 and not ai_disabled:
-        for idx, s in enumerate(high_conviction, start=1):
-            ticker = s['ticker']
-            body.append(f"{idx}. {ticker} (Score: {s['score']})")
-            body.append(f"   Price: {s['price']}")
-            body.append(f"   Signals: {', '.join(s['reasons'])}")
+    ai_count = 0
 
-            # If AI has been disabled due to many failures, skip
-            if consecutive_ai_failures >= AI_MAX_CONSECUTIVE_FAILURES:
-                ai_disabled = True
-                body.append("   AI disabled due to repeated failures. Skipping Gemini analysis.\n")
-                continue
+    # Iterate matches and attempt Gemini (limited by AI_ANALYSIS_CAP)
+    for idx, s in enumerate(high_conviction, start=1):
+        lines.append(f"{idx}. {s['ticker']} (Score: {s['score']})")
+        lines.append(f"   Price: {s['price']}")
+        lines.append(f"   Signals: {', '.join(s['reasons'])}")
 
-            # Try primary model, then fallback model if primary fails
-            success = False
-            ai_text = "AI not configured."
-            for model_name in (AI_PRIMARY_MODEL, AI_FALLBACK_MODEL):
-                for attempt in range(AI_MAX_RETRIES):
-                    ok, txt = get_gemini_analysis(ticker, active_model=model_name)
-                    if ok:
-                        success = True
-                        ai_text = txt
-                        break
-                    else:
-                        print(f"   ⚠️ Gemini {model_name} attempt {attempt+1} failed for {ticker}: {txt}")
-                        time.sleep(1 + attempt)
-                if success:
-                    ai_used = True
+        if ai_disabled:
+            lines.append("   AI disabled; skipping Gemini analysis.\n")
+            continue
+
+        if ai_count >= AI_ANALYSIS_CAP:
+            lines.append(f"   AI analysis cap reached ({AI_ANALYSIS_CAP}); skipping further AI analysis.\n")
+            ai_disabled = True
+            continue
+
+        # Attempt primary then fallback model with retries; detect fatal model-not-found
+        success = False
+        fatal = False
+        ai_text = ""
+        for model in (AI_PRIMARY_MODEL, AI_FALLBACK_MODEL):
+            for attempt in range(AI_MAX_RETRIES):
+                ok, txt, is_fatal = get_gemini_analysis(s['ticker'], model)
+                if is_fatal:
+                    fatal = True
+                    ai_text = txt
+                    break
+                if ok:
+                    success = True
+                    ai_text = txt
                     break
                 else:
-                    print(f"   ↳ Model {model_name} failed for {ticker}; trying next model if available.")
+                    print(f"   ⚠️ {model} attempt {attempt+1} failed for {s['ticker']}: {txt}")
+                    time.sleep(1 + attempt)
+            if success or fatal:
+                break
 
-            if not success:
-                consecutive_ai_failures += 1
-                body.append(f"   🧠 Gemini analysis failed for {ticker} (consecutive AI failures: {consecutive_ai_failures}).\n")
-                if consecutive_ai_failures >= AI_MAX_CONSECUTIVE_FAILURES:
-                    body.append("   🛑 Reached maximum consecutive AI failures; future tickers will skip AI.\n")
-            else:
-                consecutive_ai_failures = 0
-                body.append("   🧠 Gemini Verdict:\n")
-                # indent AI text
-                for line in ai_text.splitlines():
-                    body.append(f"      {line}")
-                body.append("")
+        if fatal:
+            ai_disabled = True
+            lines.append("   🛑 Gemini model not available on this runner (model-not-found). AI disabled for rest of run.\n")
+            lines.append(f"   Diagnostic: {ai_text}\n")
+            # don't increment ai_count; it's disabled now
+            continue
 
+        if not success:
+            consecutive_ai_failures += 1
+            lines.append(f"   🧠 Gemini analysis failed for {s['ticker']} (consecutive AI failures: {consecutive_ai_failures}).\n")
+            if consecutive_ai_failures >= AI_MAX_CONSECUTIVE_FAILURES:
+                ai_disabled = True
+                lines.append("   🛑 Reached maximum consecutive AI failures; disabling AI for rest of run.\n")
+            continue
+        else:
+            consecutive_ai_failures = 0
+            ai_used = True
+            ai_count += 1
+            lines.append("   🧠 Gemini Verdict:")
+            for L in ai_text.splitlines():
+                lines.append(f"      {L}")
+            lines.append("")
             time.sleep(SLEEP_BETWEEN_AI)
 
-    # If no matches or AI disabled/skipped, still show technical list
     if match_count == 0:
-        body.append("No matches passed the technical threshold today.\n")
+        lines.append("No matches passed the technical threshold today.\n")
 
-    # Diagnostics
-    body.append("\n--- DIAGNOSTICS ---")
-    body.append(f"Failed downloads / missing tickers: {len(failed_downloads)}")
+    # Diagnostics summary
+    lines.append("\n--- DIAGNOSTICS ---")
+    lines.append(f"Failed downloads / missing tickers: {len(failed_downloads)}")
     if failed_downloads:
-        body.append(", ".join(sorted(list(failed_downloads))[:200]) + ("" if len(failed_downloads) <= 200 else f"... (+{len(failed_downloads)-200} more)"))
-    body.append(f"Tickers that crashed during analysis: {len(failed_analysis)}")
+        lines.append(", ".join(sorted(list(failed_downloads))[:200]) + ("" if len(failed_downloads) <= 200 else f"... (+{len(failed_downloads)-200} more)"))
+    lines.append(f"Tickers that crashed during analysis: {len(failed_analysis)}")
     if failed_analysis:
-        body.append(", ".join(sorted(list(failed_analysis))[:200]) + ("" if len(failed_analysis) <= 200 else f"... (+{len(failed_analysis)-200} more)"))
-    body.append(f"AI used: {'Yes' if ai_used else 'No'}")
-    body.append(f"AI disabled due to consecutive failures: {'Yes' if consecutive_ai_failures >= AI_MAX_CONSECUTIVE_FAILURES else 'No'}")
+        lines.append(", ".join(sorted(list(failed_analysis))[:200]) + ("" if len(failed_analysis) <= 200 else f"... (+{len(failed_analysis)-200} more)"))
+    lines.append(f"AI used: {'Yes' if ai_used else 'No'}")
+    lines.append(f"AI disabled due to fatal model-not-found or failures: {'Yes' if ai_disabled else 'No'}")
+    lines.append(f"AI analyses performed this run: {ai_count} (cap: {AI_ANALYSIS_CAP})")
 
-    final_body = "\n".join(body)
+    body = "\n".join(lines)
     subject = f"🚀 {match_count} High-Conviction Breakouts (>= {TECHNICAL_SCORE_THRESHOLD})" if match_count else f"⚠️ MARKET SCAN: 0 Matches ({datetime.date.today()})"
-
-    # Send final report
-    sent = send_email(subject, final_body)
+    sent = send_email(subject, body)
     if not sent:
-        print("❌ Final report failed to send; please check EMAIL_* secrets and Action logs.")
+        print("❌ Final report failed to send; check EMAIL secrets and logs.")
     else:
-        print("✅ Final report sent (or at least an attempt was made).")
+        print("✅ Final report sent or attempted.")
 
 if __name__ == "__main__":
     run_scanner()
