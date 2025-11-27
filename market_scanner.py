@@ -19,7 +19,7 @@ import talib
 # Configuration
 CHUNK_SIZE = 30  # Download 30 tickers at a time
 CHUNK_DELAY = 1.5  # Sleep 1.5 seconds between chunks (anti-ban protection)
-MIN_SCORE = 70  # Minimum score to qualify
+MIN_SCORE = 80  # Minimum score to qualify
 MIN_PRICE = 5.0  # Filter out penny stocks below $5
 LOOKBACK_DAYS = 250  # Need enough data for SMA233
 
