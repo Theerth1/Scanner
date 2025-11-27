@@ -1,34 +1,41 @@
-name: Daily Stock Scanner
+name: Market Scanner (daily)
 
 on:
   schedule:
-    - cron: '0 13 * * 1-5'
-  workflow_dispatch:
+    # runs daily at 09:30 UTC; change as needed (cron uses UTC)
+    - cron: "0 8 * * 1-5"
+  workflow_dispatch: {}
 
 jobs:
-  run-scanner:
+  scan:
     runs-on: ubuntu-latest
+    timeout-minutes: 180  # adjust if you expect longer runs
+    env:
+      GENAI_API_KEY: ${{ secrets.GENAI_API_KEY }}
+      EMAIL_SENDER: ${{ secrets.EMAIL_SENDER }}
+      EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
+      EMAIL_RECEIVER: ${{ secrets.EMAIL_RECEIVER }}
+      # Optional overrides
+      CHUNK_SIZE: "30"
+      TECHNICAL_SCORE_THRESHOLD: "70"
+      AI_ANALYSIS_CAP: "25"
 
     steps:
-      - name: Checkout Code
-        uses: actions/checkout@v3
+      - name: Checkout repo
+        uses: actions/checkout@v4
 
       - name: Set up Python
         uses: actions/setup-python@v4
         with:
-          python-version: '3.12'
+          python-version: '3.11'
 
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+          # ensure latest google generative client to support newer Gemini models
           pip install --upgrade google-generativeai
 
-
-      - name: Run Scanner Script
-        env:
-          GENAI_API_KEY: ${{ secrets.GENAI_API_KEY }}
-          EMAIL_SENDER: ${{ secrets.EMAIL_SENDER }}
-          EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
-          EMAIL_RECEIVER: ${{ secrets.EMAIL_RECEIVER }}
-        run: python market_scanner.py
+      - name: Run market scanner
+        run: |
+          python market_scanner.py
