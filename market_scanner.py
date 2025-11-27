@@ -132,15 +132,22 @@ def calculate_catos_score(df: pd.DataFrame) -> Tuple[float, Dict]:
                 else: score += 15
             else: score += 5
 
+        # 6. VOLUME / EXHAUSTION CHECK
         vol_sma = talib.SMA(volume, timeperiod=20)[-1]
-        if volume[-1] > 1.2 * vol_sma:  # 20% above average
+        
+        # Calculate Relative Volume
+        rel_vol = volume[-1] / vol_sma if vol_sma > 0 else 0.0
+        
+        # Save exact text for email
+        details['vol_desc'] = f"{rel_vol:.1f}x Avg"
+
+        if rel_vol > 1.2:  # 20% above average
             score += 10
-            details['vol'] = "High Volume (Confirmed)"
-        elif volume[-1] > vol_sma:
-            score += 5
-            details['vol'] = "Slight Volume Increase"
+            details['vol_desc'] += " (Strong)"
+        elif rel_vol < 0.7: # 30% below average
+            details['vol_desc'] += " (Exhaustion Risk)"
         else:
-            details['vol'] = "Low Volume (Caution)"
+            details['vol_desc'] += " (Normal)"
 
 
         # 5. BREAKOUT
@@ -242,7 +249,7 @@ def send_email_report(results: List[Dict], email_config: Dict):
                 <table style="width: 100%; border-collapse: collapse;">
                     <tr><td style="padding: 3px 0;"><b>Price:</b></td><td>${d.get('price', 0):.2f}</td></tr>
                     <tr><td style="padding: 3px 0;"><b>Setup:</b></td><td>{d.get('trend', 'N/A')}</td></tr>
-                    <tr><td style="padding: 3px 0;"><b>MACD:</b></td><td>{d.get('macd_desc', 'N/A')}</td></tr>
+                    <tr><td style="padding: 3px 0;"><b>Volume:</b></td><td>{d.get('vol_desc', 'N/A')}</td></tr> <tr><td style="padding: 3px 0;"><b>MACD:</b></td><td>{d.get('macd_desc', 'N/A')}</td></tr>
                     <tr><td style="padding: 3px 0;"><b>DMI:</b></td><td>{d.get('dmi_desc', 'N/A')}</td></tr>
                     <tr><td style="padding: 3px 0;"><b>StochRSI:</b></td><td>{d.get('stoch_desc', 'N/A')}</td></tr>
                     <tr><td style="padding: 3px 0;"><b>Sector:</b></td><td>{d.get('sector', 'N/A')}</td></tr>
@@ -284,7 +291,6 @@ def main():
 
     # 2. Scan
     tickers = get_all_tickers()
-    # tickers = tickers[:200] # Uncomment for fast testing
     data = download_data_in_chunks(tickers)
     
     candidates = []
@@ -293,9 +299,16 @@ def main():
         if score >= MIN_SCORE:
             print(f"⭐ Match: {ticker} ({score})")
             candidates.append({'ticker': ticker, 'score': score, 'details': details})
-            
+    
+    # --- CRITICAL FIX START ---
+    # Sort by Score (Highest first) and keep only Top 20
+    candidates.sort(key=lambda x: x['score'], reverse=True)
+    final_candidates = candidates[:20] 
+    print(f"\nSending top {len(final_candidates)} of {len(candidates)} matches to AI...")
+    # --- CRITICAL FIX END ---
+
     # 3. Validate & Send
-    final_list = validate_with_gemini(candidates, api_key)
+    final_list = validate_with_gemini(final_candidates, api_key)
     send_email_report(final_list, email_config)
 
 if __name__ == "__main__":
