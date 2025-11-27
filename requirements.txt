@@ -1,5 +1,5 @@
 yfinance
 pandas
-pandas-ta
-google-generativeai
+pandas_ta
+google-generativeai>=0.8.3
 requests
