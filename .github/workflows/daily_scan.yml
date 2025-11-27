@@ -29,17 +29,12 @@ jobs:
           python -V
           python -m pip --version
 
-      - name: Install dependencies (fixed)
+      - name: Install dependencies
         run: |
           python -m pip install --upgrade pip setuptools wheel
-          if [ -f requirements.txt ]; then
-            cat requirements.txt
-            pip install -r requirements.txt
-          else
-            echo "requirements.txt not found"
-          fi
-          # force-upgrade google client too
+          pip install -r requirements.txt
           pip install --upgrade google-generativeai
+
 
       - name: Verify pandas-ta import (debug)
         run: |
