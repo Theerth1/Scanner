@@ -69,7 +69,6 @@ def calculate_catos_score(df: pd.DataFrame) -> Tuple[float, Dict]:
     if len(df) < 250: return 0.0, {}
     
     try:
-        # Data Prep
         close = df['Close'].values
         high = df['High'].values
         low = df['Low'].values
@@ -77,8 +76,7 @@ def calculate_catos_score(df: pd.DataFrame) -> Tuple[float, Dict]:
         
         if close[-1] < MIN_PRICE: return 0.0, {}
 
-        # 1. TREND (40 pts)
-        # Logic: Price > 21 > 55 > 233 (Perfect Bullish Alignment)
+        # 1. TREND
         sma21 = talib.SMA(close, timeperiod=21)[-1]
         sma55 = talib.SMA(close, timeperiod=55)[-1]
         sma233 = talib.SMA(close, timeperiod=233)[-1]
@@ -92,68 +90,55 @@ def calculate_catos_score(df: pd.DataFrame) -> Tuple[float, Dict]:
         elif sma21 > sma55 > sma233:
             score += 20
             details['trend'] = "Strong Trend (21 > 55 > 233)"
+        else:
+            details['trend'] = "Weak Trend"
             
-        # 2. MOMENTUM - MACD (20 pts)
-        # Logic: Signal > Line (Bullish) AND Line > 0 (Positive Trend)
+        # 2. MOMENTUM - MACD
         macd, signal, hist = talib.MACD(close, fastperiod=12, slowperiod=26, signalperiod=9)
-        
+        # Store raw text for the report
         if macd[-1] > signal[-1] and macd[-1] > 0:
             score += 20
-            details['macd'] = "Bullish & Positive (Continuation)"
+            details['macd_desc'] = "Bullish (Positive & Rising)"
         elif macd[-1] > signal[-1]:
             score += 10
-            details['macd'] = "Bullish Crossover"
+            details['macd_desc'] = "Bullish Crossover"
+        else:
+            details['macd_desc'] = "Bearish"
 
-        # 3. STRENGTH - DMI/ADX (20 pts)
-        # Logic: +DI > -DI (Bulls control) AND ADX > 20 (Trend exists)
+        # 3. STRENGTH - DMI/ADX
         adx = talib.ADX(high, low, close, timeperiod=14)[-1]
         plus_di = talib.PLUS_DI(high, low, close, timeperiod=14)[-1]
         minus_di = talib.MINUS_DI(high, low, close, timeperiod=14)[-1]
         
+        # Save exact figures for the report
+        details['dmi_desc'] = f"{'Bullish' if plus_di > minus_di else 'Bearish'} (+DI {plus_di:.1f} / -DI {minus_di:.1f})"
+        
         if plus_di > minus_di and adx > 20:
             score += 20
-            details['adx'] = f"Strong Trend (ADX {adx:.0f})"
         elif plus_di > minus_di:
             score += 10
-            details['adx'] = "Bulls Leading (+DI > -DI)"
 
-        # 4. ENTRY SIGNAL - STOCH RSI (20 pts)
-        # Logic: K > D (Momentum up)
-        # For Continuation: If K > 50, it means we are in the "Power Zone" pushing higher
+        # 4. STOCH RSI
         fastk, fastd = talib.STOCHRSI(close, timeperiod=14, fastk_period=14, fastd_period=3, fastd_matype=0)
         k = fastk[-1]
         d = fastd[-1]
         
+        # Save exact figures
+        details['stoch_desc'] = f"K={k:.1f}, D={d:.1f}"
+        
         if k > d:
-            if adx > 30:  # trend is strong
-                if k > 50:  # strong stochastic
-                    score += 20
-                    details['stoch'] = "Power Zone (K > D & K > 50 & Strong Trend)"
-                else:
-                    score += 15
-                    details['stoch'] = "Momentum Rising (Strong Trend)"
-            else:
-                score += 5
-                details['stoch'] = "Momentum Rising (Weak Trend)"
+            if adx > 30:
+                if k > 50: score += 20
+                else: score += 15
+            else: score += 5
 
-
-        # 5. BREAKOUT BONUS (+10 pts)
-        # Logic: Breaking 20 day high
-        high_20 = np.max(high[-21:-1]) # Max of previous 20 days
+        # 5. BREAKOUT
+        high_20 = np.max(high[-21:-1]) 
         if close[-1] > high_20:
-            score += 10 # Bonus points pushing over 100
-            details['breakout'] = "🚨 NEW 20-DAY HIGH"
-
-        vol_sma = talib.SMA(volume, timeperiod=20)[-1]
-        if volume[-1] > 1.2 * vol_sma:  # 20% above average
             score += 10
-            details['vol'] = "High Volume (Confirmed)"
-        elif volume[-1] > vol_sma:
-            score += 5
-            details['vol'] = "Slight Volume Increase"
+            details['breakout'] = "YES (New 20-Day High)"
         else:
-            details['vol'] = "Low Volume (Caution)"
-
+            details['breakout'] = "No"
 
         return score, details
 
@@ -163,104 +148,104 @@ def calculate_catos_score(df: pd.DataFrame) -> Tuple[float, Dict]:
 # --- AI VALIDATION ---
 # --- AI VALIDATION (FIXED) ---
 def validate_with_gemini(candidates: List[Dict], api_key: str) -> List[Dict]:
-    print(f"\nValidating {len(candidates)} candidates with AI...")
+    print(f"\nValidating top {len(candidates)} candidates with AI...")
     
-    if not api_key:
-        print("❌ No API Key found. Skipping AI validation.")
-        return candidates
+    # Configure GenAI
+    active_model = None
+    if api_key:
+        try:
+            genai.configure(api_key=api_key)
+            # Find a model that supports generation, prefer Flash
+            all_models = [m for m in genai.list_models() if 'generateContent' in m.supported_generation_methods]
+            for m in all_models:
+                if 'flash' in m.name.lower():
+                    active_model = genai.GenerativeModel(m.name)
+                    print(f"✅ AI Ready: {m.name}")
+                    break
+            if not active_model and all_models:
+                active_model = genai.GenerativeModel(all_models[0].name)
+                print(f"⚠️ AI Fallback: {all_models[0].name}")
+        except:
+            print("❌ AI Connection Failed")
 
-    try:
-        genai.configure(api_key=api_key)
+    validated = []
+    for i, c in enumerate(candidates):
+        ticker = c['ticker']
+        print(f"[{i+1}/{len(candidates)}] Processing {ticker}...")
         
-        # 1. Dynamically find a working model that supports content generation
-        # This prevents 404s by only selecting models your key is actually allowed to use.
-        available_models = []
-        for m in genai.list_models():
-            if 'generateContent' in m.supported_generation_methods:
-                available_models.append(m.name)
-        
-        # Prioritize Flash (Fast/Cheap) -> Pro -> Others
-        active_model_name = None
-        priority_order = ['models/gemini-1.5-flash', 'models/gemini-1.5-pro', 'models/gemini-1.0-pro']
-        
-        # Check priority list against what we actually found
-        for priority in priority_order:
-            if priority in available_models:
-                active_model_name = priority
-                break
-        
-        # Fallback to first available if strict priority fails
-        if not active_model_name and available_models:
-            active_model_name = available_models[0]
-            
-        if not active_model_name:
-            print("⚠️ API Connected, but no text generation models found. Check API Key permissions.")
-            return candidates
+        # 1. Fetch Sector/PE Data (Slow, so only doing for winners)
+        try:
+            stock_info = yf.Ticker(ticker).info
+            c['details']['sector'] = stock_info.get('sector', 'N/A')
+            c['details']['pe'] = stock_info.get('trailingPE', 'N/A')
+        except:
+            c['details']['sector'] = "N/A"
+            c['details']['pe'] = "N/A"
 
-        print(f"✅ Using AI Model: {active_model_name}")
-        model = genai.GenerativeModel(active_model_name)
-
-        validated = []
-        for c in candidates:
-            ticker = c['ticker']
-            # Simplified prompt to save tokens
-            prompt = f"""
-            Role: Hedge Fund Analyst.
-            Task: Evaluate {ticker} for a breakout trade.
-            Data: 
-            - Technical Score: {c['score']}/100
-            - Trend: {c['details'].get('trend')}
-            - Signal: {c['details'].get('breakout', 'Consolidation')}
-            
-            Output strictly in this format:
-            VERDICT: [BUY or WAIT]
-            REASON: [1 sentence summary]
-            """
+        # 2. Run AI
+        if active_model:
+            prompt = f"Analyze {ticker}. Technical score {c['score']}/100. Trend: {c['details']['trend']}. Give a 1-sentence verdict on fundamentals."
             try:
-                # Add a small timeout to prevent hanging
-                response = model.generate_content(prompt, request_options={'timeout': 10})
+                response = active_model.generate_content(prompt)
                 c['ai_analysis'] = response.text.strip()
-                time.sleep(1.5) # Respect rate limits (15 RPM for free tier)
-            except Exception as e:
-                error_msg = str(e)
-                if "429" in error_msg:
-                    c['ai_analysis'] = "Rate Limited (Wait)"
-                    time.sleep(5) # Back off longer if hit limit
-                else:
-                    c['ai_analysis'] = f"Error: {error_msg[:20]}..."
-                    print(f"⚠️ Error on {ticker}: {error_msg}")
+                time.sleep(4) # Rate limit safety
+            except:
+                c['ai_analysis'] = "AI Unavailable"
+        else:
+            c['ai_analysis'] = "AI Not Configured"
             
-            validated.append(c)
-            
-        return validated
-
-    except Exception as e:
-        print(f"❌ AI System Fatal Error: {e}")
-        return candidates
-
+        validated.append(c)
+        
+    return validated
 # --- REPORTING ---
 def send_email_report(results: List[Dict], email_config: Dict):
     print("\nSending email...")
     msg = MIMEMultipart('alternative')
-    msg['Subject'] = f"🚀 Breakout Scanner: {len(results)} Matches"
+    
+    # --- RENAME HEADER HERE ---
+    current_date = datetime.now().strftime("%Y-%m-%d")
+    msg['Subject'] = f"Market Scan: {current_date} - {len(results)} Setup(s) Found"
+    
     msg['From'] = email_config['sender']
     msg['To'] = email_config['receiver']
     
-    body = "<h2>Daily Breakout Report</h2>"
+    body = """
+    <html>
+      <body style="font-family: Arial, sans-serif; color: #333;">
+        <h2 style="background-color: #2c3e50; color: white; padding: 10px;">Daily Market Scans</h2>
+    """
+    
     if not results:
-        body += "<p>No stocks met the strict continuation criteria today.</p>"
+        body += "<p>No setups met the criteria today.</p>"
     else:
         for r in results:
             d = r['details']
+            
+            # Format P/E nicely if it's a number
+            pe_str = f"{d.get('pe', 'N/A'):.2f}" if isinstance(d.get('pe'), (int, float)) else "N/A"
+            
             body += f"""
-            <div style="padding:10px; border-bottom:1px solid #ccc;">
-                <h3>{r['ticker']} (Score: {r['score']:.0f})</h3>
-                <p><b>Trend:</b> {d.get('trend', 'N/A')}</p>
-                <p><b>Breakout:</b> {d.get('breakout', 'None')}</p>
-                <p><b>AI Verdict:</b><br><i>{r.get('ai_analysis', 'N/A')}</i></p>
+            <div style="border: 1px solid #ddd; margin-bottom: 20px; padding: 15px; border-radius: 8px;">
+                <h3 style="margin-top: 0; color: #0056b3;">{r['ticker']} - {r['score']:.1f}%</h3>
+                
+                <table style="width: 100%; border-collapse: collapse;">
+                    <tr><td style="padding: 3px 0;"><b>Price:</b></td><td>${d.get('price', 0):.2f}</td></tr>
+                    <tr><td style="padding: 3px 0;"><b>Setup:</b></td><td>{d.get('trend', 'N/A')}</td></tr>
+                    <tr><td style="padding: 3px 0;"><b>MACD:</b></td><td>{d.get('macd_desc', 'N/A')}</td></tr>
+                    <tr><td style="padding: 3px 0;"><b>DMI:</b></td><td>{d.get('dmi_desc', 'N/A')}</td></tr>
+                    <tr><td style="padding: 3px 0;"><b>StochRSI:</b></td><td>{d.get('stoch_desc', 'N/A')}</td></tr>
+                    <tr><td style="padding: 3px 0;"><b>Sector:</b></td><td>{d.get('sector', 'N/A')}</td></tr>
+                    <tr><td style="padding: 3px 0;"><b>P/E:</b></td><td>{pe_str}</td></tr>
+                </table>
+                
+                <div style="margin-top: 10px; background-color: #f0f4f8; padding: 10px; border-radius: 4px;">
+                    <b>AI Analysis:</b><br>
+                    <i style="color: #444;">{r.get('ai_analysis', 'N/A')}</i>
+                </div>
             </div>
             """
-    
+            
+    body += "</body></html>"
     msg.attach(MIMEText(body, 'html'))
     
     try:
@@ -271,7 +256,6 @@ def send_email_report(results: List[Dict], email_config: Dict):
         print("✅ Email sent successfully")
     except Exception as e:
         print(f"❌ Email failed: {e}")
-
 def main():
     print("Starting Scan...")
     
