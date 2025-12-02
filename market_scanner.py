@@ -202,7 +202,7 @@ def validate_with_gemini(candidates: List[Dict], api_key: str) -> List[Dict]:
 
         # 2. Run AI
         if active_model:
-            prompt = f"Analyze {ticker}. Technical score {c['score']}/120. Trend: {c['details']['trend']}. Give a 1-sentence verdict if these stocks are bullish (breakout after consolidation/continuation trading) using fundamental analysis."
+            prompt = f"Analyze {ticker}. Technical score {c['score']}/120. Trend: {c['details']['trend']}. Give a 1-sentence verdict if these stocks are bullish (breakout after consolidation/continuation trading) using fundamental analysis. Make sure to rely only on fundamental analysis for your verdict and afterwards, compare it to the technical analysis score and details and give a final say on if the ticker is a bullish buy, should not be bought, or a weary buy."
             try:
                 response = active_model.generate_content(prompt)
                 c['ai_analysis'] = response.text.strip()
