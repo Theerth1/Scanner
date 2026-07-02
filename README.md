@@ -1,4 +1,2 @@
-- improves scanner method that I currently use to find stocks (trading w/trend + breakout after consolidation); eliminates current manual search
-- accounts for volume, stochrsi, smas, MACD, DMI, etc.
-- of all tickers, it finds the stocks that best match the green signal with all these indicators and the ones with >80% are fed to LLM to get fundamental analysis
-- best stocks are sent to my email every morning
+This screener automates the current manual strategy I have in place for identifying high-potential stocks. Accounts for StochRSI, MACD, DMI, etc. Each ticker is cross referenced with each of these indicators, and the stocks that best match this green signal are fed into an LLM to get fundamental analysis. Best stocks are then sent to my email every morning.
+
