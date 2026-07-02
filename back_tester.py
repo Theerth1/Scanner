@@ -5,15 +5,14 @@ from backtesting import Backtest, Strategy
 from backtesting.lib import crossover
 import talib
 
-# --- 1. DEFINE THE STRATEGY ---
-class CatosBreakout(Strategy):
-    # Parameters
+class Breakout(Strategy):
+    # static
     n_sma21 = 21
     n_sma55 = 55
     n_sma233 = 233
     
     def init(self):
-        # Pre-calculate indicators for speed
+        # Pre-calculate indicators
         close = self.data.Close
         high = self.data.High
         low = self.data.Low
@@ -38,10 +37,8 @@ class CatosBreakout(Strategy):
         # Volume SMA
         self.vol_sma = self.I(talib.SMA, volume.astype(float), 20)
 
-    def next(self):
-        # --- ENTRY LOGIC (Your "Score >= 80" Criteria) ---
-        
-        # 1. Trend (Price > 21 > 55 > 233)
+    def next(self): 
+        # 1. Price > 21 > 55 > 233
         trend_ok = (self.data.Close[-1] > self.sma21[-1] > self.sma55[-1] > self.sma233[-1])
         
         # 2. Momentum (MACD > Signal)
@@ -58,25 +55,24 @@ class CatosBreakout(Strategy):
         vol_ok = (self.data.Volume[-1] > 1.2 * self.vol_sma[-1])
 
         # Combined Entry (If mostly true)
-        # We treat this as "Score >= 80"
+        # Treat this as "Score >= 80"
         if not self.position:
             if trend_ok and macd_ok and dmi_ok and stoch_ok:
                 self.buy()
 
-        # --- EXIT LOGIC (Trailing Stop) ---
-        # Sell if Price closes BELOW the 21 EMA (Trend Break)
+        # EXIT LOGIC (Trailing Stop): sell if Price closes BELOW the 21 EMA (Trend Break)
         elif self.position:
             if self.data.Close[-1] < self.sma21[-1]:
                 self.position.close()
 
-# --- 2. RUN THE BACKTEST ---
+# RUN BACKTEST
 def run_test(ticker):
     print(f"Testing {ticker}...")
     # Download 2 years of data
     data = yf.download(ticker, period="2y", progress=False)
     
     # Run Backtest
-    bt = Backtest(data, CatosBreakout, cash=10000, commission=.002)
+    bt = Backtest(data, Breakout, cash=10000, commission=.002)
     stats = bt.run()
     
     print(stats)
