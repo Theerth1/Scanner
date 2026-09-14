@@ -1,4 +1,4 @@
-yfinance>=0.2.32
+yfinance>=1.7.0
 pandas>=2.0.0
 numpy>=1.24.0
 google-genai>=1.0.0
