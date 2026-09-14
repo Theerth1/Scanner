@@ -303,7 +303,7 @@ def validate_with_gemini(candidates: List[Dict], api_key: str) -> List[Dict]:
                 c['ai_analysis'] = (response.text or "").strip() or "Empty response"
             except Exception as e:
                 print(f"  ❌ Gemini error for {ticker}: {e}")
-                c['ai_analysis'] = f"AI Unavailable ({type(e).__name__}: {e})"
+                c['ai_analysis'] = "AI validation unavailable (error logged in CI output)"
             time.sleep(GEMINI_DELAY)  # Rate limit safety (~10 RPM free tier)
         else:
             c['ai_analysis'] = "AI Not Configured"
